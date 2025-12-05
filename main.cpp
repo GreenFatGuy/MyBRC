@@ -3,7 +3,9 @@
 #include <fstream>
 #include <limits>
 #include <string_view>
-#include <map>
+#include <unordered_map>
+#include <vector>
+#include <algorithm>
 
 static constexpr char DATA[] = "measurements.txt";
 static constexpr char DELIM = ';';
@@ -16,12 +18,19 @@ struct Data {
     size_t count = 0;
 };
 
-using Result = std::map<std::string, Data>;
+using Result = std::unordered_map<std::string, Data>;
 
 void print_results(const Result& r) {
     std::cout << std::fixed << std::setprecision(1) << "{";
     bool first = true;
+    std::vector<std::pair<std::string, Data>> v;
     for (auto&& [name, data] : r) {
+        v.push_back({name,data});
+    }
+    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.first < b.first; });
+
+
+    for (auto&& [name, data] : v) {
         if (!first)
             std::cout << ", ";
 

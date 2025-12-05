@@ -121,24 +121,24 @@ void update_result(Result& r, std::string_view name, int64_t v) {
     s.count++;
 }
 
-constexpr std::tuple<int64_t, int> parse_value(const char* end) {
-    std::array<int8_t, 3> digits = {0, 0, 0};
-    int l3 = end[-4] == DELIM;
-    int l4 = end[-5] == DELIM;
-    int l5 = (1 - l3 - l4);
+constexpr std::tuple<int16_t, int8_t> parse_value(const char* end) {
+    std::array<int16_t, 3> digits = {0, 0, 0};
+    int8_t l3 = end[-4] == DELIM;
+    int8_t l4 = end[-5] == DELIM;
+    int8_t l5 = (1 - l3 - l4);
 
     digits[2] = end[-1] - '0';
     digits[1] = end[-3] - '0';
-    int sign = end[-4] == '-';
+    int16_t sign = end[-4] == '-';
     digits[0] = (1 - sign) * (1 - l3) * (end[-4] - '0');
 
     sign = sign | (end[-5] == '-');
     const int64_t val = (1 - 2 * sign) * (
-        100 * static_cast<int64_t>(digits[0]) +
-        10 * static_cast<int64_t>(digits[1]) +
-        1 * static_cast<int64_t>(digits[2])
+        100 * digits[0] +
+        10  * digits[1] +
+        1   * digits[2]
     );
-    const int len = (3 * l3 + 4 * l4 + 5 * l5);
+    const int8_t len = (3 * l3 + 4 * l4 + 5 * l5);
     return std::tie(val, len);
 }
 
@@ -149,14 +149,14 @@ static constexpr char test2[] = "a;-1.2";
 static constexpr char test3[] = "a;12.3";
 static constexpr char test4[] = "a;-12.3";
 
-static_assert(std::get<int64_t>(parse_value(test1 + 5)) == 12l);
-static_assert(std::get<int>(parse_value(test1 + 5)) == 3);
-static_assert(std::get<int64_t>(parse_value(test2 + 6)) == -12);
-static_assert(std::get<int>(parse_value(test2 + 6)) == 4);
-static_assert(std::get<int64_t>(parse_value(test3 + 6)) == 123);
-static_assert(std::get<int>(parse_value(test3 + 6)) == 4);
-static_assert(std::get<int64_t>(parse_value(test4 + 7)) == -123);
-static_assert(std::get<int>(parse_value(test4 + 7)) == 5);
+static_assert(std::get<int16_t>(parse_value(test1 + 5)) == 12l);
+static_assert(std::get<int8_t>(parse_value(test1 + 5)) == 3);
+static_assert(std::get<int16_t>(parse_value(test2 + 6)) == -12);
+static_assert(std::get<int8_t>(parse_value(test2 + 6)) == 4);
+static_assert(std::get<int16_t>(parse_value(test3 + 6)) == 123);
+static_assert(std::get<int8_t>(parse_value(test3 + 6)) == 4);
+static_assert(std::get<int16_t>(parse_value(test4 + 7)) == -123);
+static_assert(std::get<int8_t>(parse_value(test4 + 7)) == 5);
 
 }
 

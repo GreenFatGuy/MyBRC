@@ -98,6 +98,9 @@ public:
         , size_(get_size(fd_))
         , ptr_(do_mmap(fd_, size_))
     {
+        const int ret = ::madvise(ptr_, size_, MADV_SEQUENTIAL);
+        if (ret < 0)
+            panic("err madvise");
     }
 
     ~MMappedFile() {

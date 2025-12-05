@@ -1,3 +1,6 @@
 #!/bin/bash
 
-clang++-18 -O3 -g -fno-omit-frame-pointer -march=native main.cpp -o brc
+set -xeuo pipefail
+
+clang++-20 -O3 -g -fno-omit-frame-pointer -march=native -flto=thin -std=c++23 main.cpp -o brc
+

@@ -1,27 +1,28 @@
+#include <algorithm>
+#include <array>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
-#include <fstream>
 #include <limits>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
-#include <algorithm>
-#include <cstring>
 
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 static constexpr char DATA[] = "measurements.txt";
 static constexpr char DELIM = ';';
 static constexpr char NEW_LINE = '\n';
 
 struct Data {
-    double min = std::numeric_limits<double>::max();
-    double max = std::numeric_limits<double>::min();
-    double sum = 0.0;
+    int64_t min = std::numeric_limits<int64_t>::max();
+    int64_t max = std::numeric_limits<int64_t>::min();
+    int64_t sum = 0;
     size_t count = 0;
 };
 
@@ -42,7 +43,9 @@ void print_results(const Result& r) {
         if (!first)
             std::cout << ", ";
 
-        std::cout << name << "=" << data.min << "/" << (data.sum / data.count) << "/" << data.max;
+        std::cout << name << "=" << (static_cast<double>(data.min) / 10.0) << "/"
+            << (static_cast<double>(data.sum) / 10.0 / data.count) << "/"
+            << (static_cast<double>(data.max) / 10.0);
         first = false;
     }
     std::cout << "}\n";
@@ -110,13 +113,53 @@ private:
     void* ptr_;
 };
 
-void update_result(Result& r, std::string_view name, double v) {
+void update_result(Result& r, std::string_view name, int64_t v) {
     auto& s = r[std::string(name)];
     s.min = std::min(v, s.min);
     s.max = std::max(v, s.max);
     s.sum += v;
     s.count++;
 }
+
+constexpr std::tuple<int64_t, int> parse_value(const char* end) {
+    std::array<int8_t, 3> digits = {0, 0, 0};
+    int l3 = end[-4] == DELIM;
+    int l4 = end[-5] == DELIM;
+    int l5 = (1 - l3 - l4);
+
+    digits[2] = end[-1] - '0';
+    digits[1] = end[-3] - '0';
+    int sign = end[-4] == '-';
+    digits[0] = (1 - sign) * (1 - l3) * (end[-4] - '0');
+
+    sign = sign | (end[-5] == '-');
+    const int64_t val = (1 - 2 * sign) * (
+        100 * static_cast<int64_t>(digits[0]) +
+        10 * static_cast<int64_t>(digits[1]) +
+        1 * static_cast<int64_t>(digits[2])
+    );
+    const int len = (3 * l3 + 4 * l4 + 5 * l5);
+    return std::tie(val, len);
+}
+
+namespace {
+
+static constexpr char test1[] = "a;1.2";
+static constexpr char test2[] = "a;-1.2";
+static constexpr char test3[] = "a;12.3";
+static constexpr char test4[] = "a;-12.3";
+
+static_assert(std::get<int64_t>(parse_value(test1 + 5)) == 12l);
+static_assert(std::get<int>(parse_value(test1 + 5)) == 3);
+static_assert(std::get<int64_t>(parse_value(test2 + 6)) == -12);
+static_assert(std::get<int>(parse_value(test2 + 6)) == 4);
+static_assert(std::get<int64_t>(parse_value(test3 + 6)) == 123);
+static_assert(std::get<int>(parse_value(test3 + 6)) == 4);
+static_assert(std::get<int64_t>(parse_value(test4 + 7)) == -123);
+static_assert(std::get<int>(parse_value(test4 + 7)) == 5);
+
+}
+
 
 int main() {
     MMappedFile f(DATA);
@@ -129,16 +172,15 @@ int main() {
     size_t space = std::distance(ptr, end);
     //int i = 0;
     while (/*i < 10 &&*/ space > 0) {
-        const char* d = static_cast<const char*>(std::memchr(ptr, DELIM, space));
-        const char* n = static_cast<const char*>(std::memchr(d, NEW_LINE, space - std::distance(ptr, d)));
-        const auto name = std::string_view(ptr, std::distance(ptr, d));
-        const auto val = std::atof(d + 1);
+        const char* n = static_cast<const char*>(std::memchr(ptr, NEW_LINE, space));
+        const auto [val, len] = parse_value(n);
+        const auto name = std::string_view(ptr, (std::distance(ptr, n) - (len+1)));
         update_result(stats, name, val);
 
         ptr = (n + 1);
         space = std::distance(ptr, end);
 
-        //std::cout << "name=" << name << " val=" << val << " space=" << space << "\n";
+        //std::cout << "name=" << name << " val=" << val << " len=" << len << " space=" << space << std::endl;
         //++i;
     }
 

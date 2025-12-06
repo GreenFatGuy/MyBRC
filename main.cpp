@@ -60,10 +60,9 @@ public:
 
   Result() = default;
 
-  std::tuple<KV &, bool> try_emplace(std::string_view name, Data &&v) {
+  Data &try_emplace(std::string_view name, Data &&v) {
     const std::size_t h = fnv1a()(name);
-    const std::size_t idx = h & (BUCKETS - 1);
-    auto &b = map_[idx];
+    auto &b = map_[h & (BUCKETS - 1)];
 
     auto it = std::find_if(b.begin(), b.end(),
                            [&](auto &p) { return p.first == name; });
@@ -74,9 +73,9 @@ public:
 
       b.emplace_back(std::string(name), std::forward<Data>(v));
       ++size_;
-      return {b.back(), true};
+      return b.back().second;
     } else {
-      return {*it, false};
+      return it->second;
     }
   }
 
@@ -87,7 +86,7 @@ public:
     v.reserve(size());
     for (const auto &b : map_) {
       for (const auto &kv : b) {
-        v.push_back(kv);
+        v.emplace_back(kv);
       }
     }
     std::sort(v.begin(), v.end(),
@@ -111,12 +110,13 @@ public:
     }
 
     std::vector<int> counts;
-    counts.resize(max+1);
+    counts.resize(max + 1);
     for (int l : loads)
       counts[l]++;
 
     std::cerr << "MyHashMap stats load factor:\n";
-    std::cerr << "\tmean chain length: " << static_cast<double>(sum) / loads.size() << "\n";
+    std::cerr << "\tmean chain length: "
+              << static_cast<double>(sum) / loads.size() << "\n";
     std::cerr << "\tmin chain length:  " << min << "\n";
     std::cerr << "\tmax chain length:  " << max << "\n";
 
@@ -126,7 +126,7 @@ public:
   }
 
 private:
-  std::array<Bucket, BUCKETS> map_;
+  std::array<Bucket, BUCKETS> map_{};
   std::size_t size_{0};
 };
 
@@ -148,17 +148,15 @@ void print_results(const Result &r) {
     first = false;
   }
   std::cout << "}\n";
-
-  r.print_stats();
 }
 
 void update_result(Result &r, std::string_view name, int64_t v) {
-  auto [s, _] = r.try_emplace(name, Data{});
+  auto &s = r.try_emplace(name, Data{});
 
-  s.second.max = std::max(v, s.second.max);
-  s.second.min = std::min(v, s.second.min);
-  s.second.sum += v;
-  s.second.count++;
+  s.max = std::max(v, s.max);
+  s.min = std::min(v, s.min);
+  s.sum += v;
+  s.count++;
 }
 
 void panic(const char *err) {

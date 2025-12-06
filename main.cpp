@@ -104,16 +104,25 @@ public:
     int min = std::numeric_limits<int>::max();
     int max = std::numeric_limits<int>::min();
 
-    for (const auto &l : loads) {
+    for (int l : loads) {
       sum += l;
       min = std::min(l, min);
       max = std::max(l, max);
     }
 
+    std::vector<int> counts;
+    counts.resize(max+1);
+    for (int l : loads)
+      counts[l]++;
+
     std::cerr << "MyHashMap stats load factor:\n";
-    std::cerr << "\tmean: " << static_cast<double>(sum) / loads.size() << "\n";
-    std::cerr << "\tmin:  " << min << "\n";
-    std::cerr << "\tmax:  " << max << "\n";
+    std::cerr << "\tmean chain length: " << static_cast<double>(sum) / loads.size() << "\n";
+    std::cerr << "\tmin chain length:  " << min << "\n";
+    std::cerr << "\tmax chain length:  " << max << "\n";
+
+    std::cerr << "Chains stats:\n";
+    for (int i = 0; i < counts.size(); ++i)
+      std::cerr << "\t" << i << " -> " << counts[i] << "\n";
   }
 
 private:

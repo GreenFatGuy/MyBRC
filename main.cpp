@@ -19,21 +19,24 @@ static constexpr char DELIM = ';';
 // static constexpr char NEW_LINE = '\n';
 // static constexpr int MAX_NAMES = 10'000;
 
-struct fnv1a {
+template <typename H>
+struct HashWrapper {
   constexpr std::size_t operator()(const std::string &s) const noexcept {
-    return fnv1a_func(s.data(), s.size());
+    return H::hash(s.data(), s.size());
   }
 
   constexpr std::size_t operator()(const std::string_view &s) const noexcept {
-    return fnv1a_func(s.data(), s.size());
+    return H::hash(s.data(), s.size());
   }
 
   constexpr std::size_t operator()(const char *s) const noexcept {
     return this->operator()(std::string_view(s));
   }
+};
 
-private:
-  constexpr std::size_t fnv1a_func(const char *s, size_t n) const noexcept {
+
+struct fnv1a {
+  static constexpr std::size_t hash(const char *s, std::size_t n) noexcept {
     std::size_t h = 14695981039346656037ull;
     for (std::size_t i = 0; i < n; ++i) {
       h ^= static_cast<uint8_t>(s[i]);
@@ -43,6 +46,30 @@ private:
   }
 };
 
+using FNV1A = HashWrapper<fnv1a>;
+
+struct fnv8a {
+  static constexpr std::size_t hash(const char *s, std::size_t n) noexcept {
+    uint64_t h = 14695981039346656037ull;
+    for (std::size_t i = n; i >= 8; i -= 8) {
+      uint64_t x = 0;
+      std::memcpy(&x, s, sizeof(x));
+      h ^= x;
+      h *= 1099511628211ull;
+      s += 8;
+      n -= 8;
+    }
+    for (std::size_t i = n & 7; i > 0; --i) {
+      h ^= static_cast<uint8_t>(*s++);
+      h *= 1099511628211ull;
+    }
+    return h;
+  }
+};
+
+using FNV8A = HashWrapper<fnv8a>;
+
+
 struct Data {
   int16_t min = std::numeric_limits<int16_t>::max();
   int16_t max = std::numeric_limits<int16_t>::min();
@@ -50,7 +77,7 @@ struct Data {
   int64_t sum = 0;
 };
 
-template <std::size_t BUCKETS = 8192, std::size_t CHAIN_START_SIZE = 2>
+template <std::size_t BUCKETS = 8192, std::size_t CHAIN_START_SIZE = 2, typename Hash = FNV1A>
 class MyHashMap {
 public:
   struct KV {
@@ -60,7 +87,7 @@ public:
   using Bucket = std::vector<KV>;
 
   Data &try_emplace(std::string_view name, Data &&v) {
-    const std::size_t h = fnv1a()(name);
+    const std::size_t h = Hash()(name);
     auto &b = map_[h & (BUCKETS - 1)];
 
     auto it = std::find_if(b.begin(), b.end(),
@@ -129,7 +156,8 @@ private:
   std::size_t size_{0};
 };
 
-template <std::size_t BUCKETS, bool DEBUG = false> class MyFlatHashMap {
+template <std::size_t BUCKETS, typename Hash = FNV1A, bool DEBUG = false>
+class MyFlatHashMap {
 public:
   static_assert((BUCKETS & (BUCKETS - 1)) == 0, "BUCKETS must be a power of 2");
   static_assert(BUCKETS > 0, "BUCKETS must be greater than 0");
@@ -141,7 +169,7 @@ public:
   };
 
   Data &try_emplace(std::string_view name, Data &&v) {
-    const std::size_t h = fnv1a()(name);
+    const std::size_t h = Hash()(name);
     std::size_t s = idx(h);
     for (std::size_t i = 0; i < BUCKETS; ++i) {
       if (map_[s].name == name) [[likely]] {
@@ -193,7 +221,7 @@ private:
   std::array<std::size_t, BUCKETS> hops_{};
 };
 
-using Result = MyFlatHashMap<32768, false>;
+using Result = MyFlatHashMap<32768, FNV8A, false>;
 
 void print_results(const Result &r) {
   std::cout << std::fixed << std::setprecision(1) << "{";

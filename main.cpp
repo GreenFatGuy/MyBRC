@@ -50,31 +50,31 @@ struct Data {
   int64_t sum = 0;
 };
 
-class Result {
+template <std::size_t BUCKETS = 8192, std::size_t CHAIN_START_SIZE = 2>
+class MyHashMap {
 public:
-  static constexpr std::size_t BUCKETS = 8192;
-  static constexpr std::size_t START_SIZE = 16;
-  using KV = std::pair<std::string, Data>;
+  struct KV {
+    std::string name;
+    Data data;
+  };
   using Bucket = std::vector<KV>;
-
-  Result() = default;
 
   Data &try_emplace(std::string_view name, Data &&v) {
     const std::size_t h = fnv1a()(name);
     auto &b = map_[h & (BUCKETS - 1)];
 
     auto it = std::find_if(b.begin(), b.end(),
-                           [&](auto &p) { return p.first == name; });
+                           [&](auto &p) { return p.name == name; });
 
     if (it == b.end()) [[unlikely]] {
       if (b.empty())
-        b.reserve(START_SIZE);
+        b.reserve(CHAIN_START_SIZE);
 
-      b.emplace_back(std::string(name), std::forward<Data>(v));
+      b.emplace_back(KV{std::string(name), std::forward<Data>(v)});
       ++size_;
-      return b.back().second;
+      return b.back().data;
     } else {
-      return it->second;
+      return it->data;
     }
   }
 
@@ -89,7 +89,7 @@ public:
       }
     }
     std::sort(v.begin(), v.end(),
-              [](auto &a, auto &b) { return a.first < b.first; });
+              [](auto &a, auto &b) { return a.name < b.name; });
     return v;
   }
 
@@ -128,6 +128,72 @@ private:
   std::array<Bucket, BUCKETS> map_{};
   std::size_t size_{0};
 };
+
+template <std::size_t BUCKETS, bool DEBUG = false> class MyFlatHashMap {
+public:
+  static_assert((BUCKETS & (BUCKETS - 1)) == 0, "BUCKETS must be a power of 2");
+  static_assert(BUCKETS > 0, "BUCKETS must be greater than 0");
+  static constexpr auto idx = [](std::size_t h) { return h & (BUCKETS - 1); };
+
+  struct KV {
+    std::string name;
+    Data data;
+  };
+
+  Data &try_emplace(std::string_view name, Data &&v) {
+    const std::size_t h = fnv1a()(name);
+    std::size_t s = idx(h);
+    for (std::size_t i = 0; i < BUCKETS; ++i) {
+      if (map_[s].name == name) [[likely]] {
+        if constexpr (DEBUG)
+          hops_[i]++;
+
+        return map_[s].data;
+      }
+
+      if (map_[s].name.empty()) [[likely]] {
+        if constexpr (DEBUG)
+          hops_[i]++;
+
+        map_[s].name = std::string(name);
+        map_[s].data = std::forward<Data>(v);
+        ++size_;
+        return map_[s].data;
+      }
+
+      s = idx(s + 1);
+    }
+    __builtin_unreachable();
+  }
+
+  std::vector<std::pair<std::string, Data>> to_plain() const {
+    std::vector<std::pair<std::string, Data>> v;
+    v.reserve(size_);
+    for (const auto &kv : map_) {
+      if (!kv.name.empty())
+        v.emplace_back(kv.name, kv.data);
+    }
+    std::sort(v.begin(), v.end(),
+              [](auto &a, auto &b) { return a.first < b.first; });
+    return v;
+  }
+
+  void print_stats() const {
+    std::cerr << "Result stats:\n";
+    for (std::size_t i = 0; i < hops_.size(); ++i) {
+      if (hops_[i] == 0)
+        continue;
+      std::cerr << "hops[" << i << "] = " << hops_[i] << "\n";
+    }
+  }
+
+private:
+  std::array<KV, BUCKETS> map_{};
+  std::size_t size_{0};
+  std::array<std::size_t, BUCKETS> hops_{};
+};
+
+using Result = MyFlatHashMap<32768, false>;
 
 void print_results(const Result &r) {
   std::cout << std::fixed << std::setprecision(1) << "{";
@@ -234,7 +300,8 @@ constexpr temp parse_value(const char *d) {
 
   int8_t neg = d[0] == '-';
 
-  // skip sign, so d points to "positive" part of the number. We down to 2 cases:
+  // skip sign, so d points to "positive" part of the number. We down to 2
+  // cases:
   // 1. 1.2
   // 3. 12.3
   d += neg;
@@ -249,8 +316,9 @@ constexpr temp parse_value(const char *d) {
   // if dot is not found (dot == 0), then d1 = d[1] - '0' (12.3 case)
   int8_t d1 = d[1 + dot] - '0';
 
-  // if dot is found (dot == 1), we don't need d2, so it equals to d1 = d[2] - '0' (1.2 case)
-  // if dot is not found (dot == 0), then d2 = d[3] - '0' (12.3 case)
+  // if dot is found (dot == 1), we don't need d2, so it equals to d1 = d[2] -
+  // '0' (1.2 case) if dot is not found (dot == 0), then d2 = d[3] - '0' (12.3
+  // case)
   int8_t d2 = d[3 - dot] - '0';
 
   // min length is 3, +1 for sign and +1 if we did not find early dot
@@ -258,7 +326,8 @@ constexpr temp parse_value(const char *d) {
   // if dot is found, val = 10 * d0 + d1
   // else val = 100 * d0 + 10 * d1 + d2
   int16_t v_small = 10 * static_cast<int16_t>(d0) + static_cast<int16_t>(d1);
-  int16_t val = (1 - 2 * neg) * (v_small * (10 - 9 * dot) + (1 - dot) * static_cast<int16_t>(d2));
+  int16_t val = (1 - 2 * neg) * (v_small * (10 - 9 * dot) +
+                                 (1 - dot) * static_cast<int16_t>(d2));
   return {val, len};
 }
 
@@ -288,11 +357,9 @@ int main() {
 
   const char *ptr = static_cast<const char *>(f.ptr());
   for (int64_t space = f.size(); space > 0;) {
-    const char *n =
-        static_cast<const char *>(std::memchr(ptr, DELIM, space));
-    const auto [val, len] = parse_value(n+1);
-    const auto name =
-        std::string_view(ptr, std::distance(ptr, n));
+    const char *n = static_cast<const char *>(std::memchr(ptr, DELIM, space));
+    const auto [val, len] = parse_value(n + 1);
+    const auto name = std::string_view(ptr, std::distance(ptr, n));
     update_result(stats, name, val);
 
     space -= std::distance(ptr, n) + 1 + len + 1;

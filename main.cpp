@@ -6,7 +6,6 @@
 #include <iostream>
 #include <limits>
 #include <string_view>
-#include <tuple>
 #include <vector>
 
 #include <fcntl.h>
@@ -17,7 +16,7 @@
 
 static constexpr char DATA[] = "measurements.txt";
 static constexpr char DELIM = ';';
-static constexpr char NEW_LINE = '\n';
+// static constexpr char NEW_LINE = '\n';
 // static constexpr int MAX_NAMES = 10'000;
 
 struct fnv1a {
@@ -45,10 +44,10 @@ private:
 };
 
 struct Data {
-  int64_t min = std::numeric_limits<int64_t>::max();
-  int64_t max = std::numeric_limits<int64_t>::min();
+  int16_t min = std::numeric_limits<int16_t>::max();
+  int16_t max = std::numeric_limits<int16_t>::min();
+  uint32_t count = 0;
   int64_t sum = 0;
-  size_t count = 0;
 };
 
 class Result {
@@ -135,8 +134,6 @@ void print_results(const Result &r) {
   bool first = true;
 
   auto v = r.to_plain();
-  std::sort(v.begin(), v.end(),
-            [](auto &a, auto &b) { return a.first < b.first; });
 
   for (auto &&[name, data] : v) {
     if (!first)
@@ -150,13 +147,13 @@ void print_results(const Result &r) {
   std::cout << "}\n";
 }
 
-void update_result(Result &r, std::string_view name, int64_t v) {
+void update_result(Result &r, std::string_view name, int16_t t) {
   auto &s = r.try_emplace(name, Data{});
 
-  s.max = std::max(v, s.max);
-  s.min = std::min(v, s.min);
-  s.sum += v;
+  s.max = std::max(t, s.max);
+  s.min = std::min(t, s.min);
   s.count++;
+  s.sum += t;
 }
 
 void panic(const char *err) {
@@ -221,41 +218,65 @@ private:
   void *ptr_;
 };
 
-constexpr std::tuple<int16_t, int8_t> parse_value(const char *end) {
-  std::array<int16_t, 3> digits = {0, 0, 0};
-  int8_t l3 = end[-4] == DELIM;
-  int8_t l4 = end[-5] == DELIM;
-  int8_t l5 = (1 - l3 - l4);
+struct temp {
+  int16_t t;
+  int8_t l;
+};
 
-  digits[2] = end[-1] - '0';
-  digits[1] = end[-3] - '0';
-  int16_t sign = end[-4] == '-';
-  digits[0] = (1 - sign) * (1 - l3) * (end[-4] - '0');
+constexpr temp parse_value(const char *d) {
+  // 4 possible cases:
+  // 1. 1.2
+  // 2. -1.2
+  // 3. 12.3
+  // 4. -12.3
 
-  sign = sign | (end[-5] == '-');
-  const int64_t val =
-      (1 - 2 * sign) * (100 * digits[0] + 10 * digits[1] + 1 * digits[2]);
-  const int8_t len = (3 * l3 + 4 * l4 + 5 * l5);
-  return std::tie(val, len);
+  int8_t neg = d[0] == '-';
+
+  // skip sign, so d points to "positive" part of the number. We down to 2 cases:
+  // 1. 1.2
+  // 3. 12.3
+  d += neg;
+
+  // d0 is always the first digit of the number
+  int8_t d0 = d[0] - '0';
+
+  // in case 1 dot is 1, in case 3 dot is 0
+  int8_t dot = d[1] == '.';
+
+  // if dot is found (dot == 1), then d1 = d[2] - '0' (1.2 case)
+  // if dot is not found (dot == 0), then d1 = d[1] - '0' (12.3 case)
+  int8_t d1 = d[1 + dot] - '0';
+
+  // if dot is found (dot == 1), we don't need d2, so it equals to d1 = d[2] - '0' (1.2 case)
+  // if dot is not found (dot == 0), then d2 = d[3] - '0' (12.3 case)
+  int8_t d2 = d[3 - dot] - '0';
+
+  // min length is 3, +1 for sign and +1 if we did not find early dot
+  int8_t len = 3 + neg + (1 - dot);
+  // if dot is found, val = 10 * d0 + d1
+  // else val = 100 * d0 + 10 * d1 + d2
+  int16_t v_small = 10 * static_cast<int16_t>(d0) + static_cast<int16_t>(d1);
+  int16_t val = (1 - 2 * neg) * (v_small * (10 - 9 * dot) + (1 - dot) * static_cast<int16_t>(d2));
+  return {val, len};
 }
 
 namespace {
 
-static constexpr char test1[] = "a;1.2";
-static_assert(std::get<int16_t>(parse_value(test1 + 5)) == 12l);
-static_assert(std::get<int8_t>(parse_value(test1 + 5)) == 3);
+static constexpr char test1[] = "1.2";
+static_assert(parse_value(test1).t == 12l);
+static_assert(parse_value(test1).l == 3);
 
-static constexpr char test2[] = "a;-1.2";
-static_assert(std::get<int16_t>(parse_value(test2 + 6)) == -12);
-static_assert(std::get<int8_t>(parse_value(test2 + 6)) == 4);
+static constexpr char test2[] = "-1.2";
+static_assert(parse_value(test2).t == -12);
+static_assert(parse_value(test2).l == 4);
 
-static constexpr char test3[] = "a;12.3";
-static_assert(std::get<int16_t>(parse_value(test3 + 6)) == 123);
-static_assert(std::get<int8_t>(parse_value(test3 + 6)) == 4);
+static constexpr char test3[] = "12.3";
+static_assert(parse_value(test3).t == 123);
+static_assert(parse_value(test3).l == 4);
 
-static constexpr char test4[] = "a;-12.3";
-static_assert(std::get<int16_t>(parse_value(test4 + 7)) == -123);
-static_assert(std::get<int8_t>(parse_value(test4 + 7)) == 5);
+static constexpr char test4[] = "-12.3";
+static_assert(parse_value(test4).t == -123);
+static_assert(parse_value(test4).l == 5);
 
 } // namespace
 
@@ -266,14 +287,14 @@ int main() {
   const char *ptr = static_cast<const char *>(f.ptr());
   for (int64_t space = f.size(); space > 0;) {
     const char *n =
-        static_cast<const char *>(std::memchr(ptr, NEW_LINE, space));
-    const auto [val, len] = parse_value(n);
+        static_cast<const char *>(std::memchr(ptr, DELIM, space));
+    const auto [val, len] = parse_value(n+1);
     const auto name =
-        std::string_view(ptr, (std::distance(ptr, n) - (len + 1)));
+        std::string_view(ptr, std::distance(ptr, n));
     update_result(stats, name, val);
 
-    space -= std::distance(ptr, n) + 1;
-    ptr = (n + 1);
+    space -= std::distance(ptr, n) + 1 + len + 1;
+    ptr = (n + 1 + len + 1);
   }
 
   print_results(stats);

@@ -278,8 +278,8 @@ size_t get_size(int fd) {
   return stat.st_size;
 }
 
-void *do_mmap(int fd, size_t size) {
-  void *ptr = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+void *do_mmap(int fd, size_t size, int opt, int flag) {
+  void *ptr = ::mmap(nullptr, size, opt, flag, fd, 0);
   if (ptr == MAP_FAILED)
     panic("err mmap");
   return ptr;
@@ -291,13 +291,19 @@ void do_unmap(void *ptr, size_t size) {
     panic("err munmap");
 }
 
+void do_madvise(void* ptr, size_t size, int adv) {
+  const int ret = ::madvise(ptr, size, adv);
+  if (ret < 0)
+    panic("err madvise");
+}
+
 class MMappedFile {
 public:
   MMappedFile(const char *file)
-      : fd_(do_open(file)), size_(get_size(fd_)), ptr_(do_mmap(fd_, size_)) {
-    const int ret = ::madvise(ptr_, size_, MADV_SEQUENTIAL);
-    if (ret < 0)
-      panic("err madvise");
+      : fd_(do_open(file)), size_(get_size(fd_))
+      , ptr_(do_mmap(fd_, size_, PROT_READ, MAP_PRIVATE))
+  {
+    do_madvise(ptr_, size_, MADV_SEQUENTIAL | MADV_HUGEPAGE);
   }
 
   ~MMappedFile() {
@@ -381,19 +387,21 @@ static_assert(parse_value(test4).l == 5);
 
 int main() {
   MMappedFile f(DATA);
-  Result stats;
+  void* res_ptr = do_mmap(-1, sizeof(Result), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON);
+  do_madvise(res_ptr, sizeof(Result), MADV_HUGEPAGE);
+  auto* stats = new (res_ptr) Result;
 
   const char *ptr = static_cast<const char *>(f.ptr());
   for (int64_t space = f.size(); space > 0;) {
     const char *n = static_cast<const char *>(std::memchr(ptr, DELIM, space));
     const auto [val, len] = parse_value(n + 1);
     const auto name = std::string_view(ptr, std::distance(ptr, n));
-    update_result(stats, name, val);
+    update_result(*stats, name, val);
 
     space -= std::distance(ptr, n) + 1 + len + 1;
     ptr = (n + 1 + len + 1);
   }
 
-  print_results(stats);
+  print_results(*stats);
   return 0;
 }

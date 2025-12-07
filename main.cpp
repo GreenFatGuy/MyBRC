@@ -52,7 +52,7 @@ struct Data {
 
 class Result {
 public:
-  static constexpr std::size_t BUCKETS = 1024;
+  static constexpr std::size_t BUCKETS = 8192;
   static constexpr std::size_t START_SIZE = 16;
   using KV = std::pair<std::string, Data>;
   using Bucket = std::vector<KV>;
@@ -145,6 +145,8 @@ void print_results(const Result &r) {
     first = false;
   }
   std::cout << "}\n";
+
+  r.print_stats();
 }
 
 void update_result(Result &r, std::string_view name, int16_t t) {

@@ -389,7 +389,7 @@ int main() {
   MMappedFile f(DATA);
   void* res_ptr = do_mmap(-1, sizeof(Result), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON);
   do_madvise(res_ptr, sizeof(Result), MADV_HUGEPAGE);
-  auto* stats = new (res_ptr) Result;
+  auto* stats = new (res_ptr) Result();
 
   const char *ptr = static_cast<const char *>(f.ptr());
   for (int64_t space = f.size(); space > 0;) {
@@ -403,5 +403,7 @@ int main() {
   }
 
   print_results(*stats);
+  delete stats;
+  do_unmap(res_ptr, sizeof(Result));
   return 0;
 }

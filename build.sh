@@ -3,9 +3,11 @@
 set -xeuo pipefail
 
 clang++-20 \
--mllvm -inline-threshold=1000 \
+-pthread \
+-mllvm -inline-threshold=10000 \
 -static \
 -fno-exceptions \
+-fno-rtti \
 -Wall \
 -Werror \
 -O3 \

@@ -1,14 +1,19 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 
 #include <sys/mman.h>
@@ -16,11 +21,10 @@
 
 static constexpr char DATA[] = "measurements.txt";
 static constexpr char DELIM = ';';
-// static constexpr char NEW_LINE = '\n';
+static constexpr char NEW_LINE = '\n';
 // static constexpr int MAX_NAMES = 10'000;
 
-template <typename H>
-struct HashWrapper {
+template <typename H> struct HashWrapper {
   constexpr std::size_t operator()(const std::string &s) const noexcept {
     return H::hash(s.data(), s.size());
   }
@@ -33,7 +37,6 @@ struct HashWrapper {
     return this->operator()(std::string_view(s));
   }
 };
-
 
 struct fnv1a {
   static constexpr std::size_t hash(const char *s, std::size_t n) noexcept {
@@ -69,7 +72,6 @@ struct fnv8a {
 
 using FNV8A = HashWrapper<fnv8a>;
 
-
 struct Data {
   int16_t min = std::numeric_limits<int16_t>::max();
   int16_t max = std::numeric_limits<int16_t>::min();
@@ -77,7 +79,8 @@ struct Data {
   int64_t sum = 0;
 };
 
-template <std::size_t BUCKETS = 8192, std::size_t CHAIN_START_SIZE = 2, typename Hash = FNV1A>
+template <std::size_t BUCKETS = 8192, std::size_t CHAIN_START_SIZE = 2,
+          typename Hash = FNV1A>
 class MyHashMap {
 public:
   struct KV {
@@ -215,6 +218,20 @@ public:
     }
   }
 
+  template <bool dbg>
+  void merge(const MyFlatHashMap<BUCKETS, Hash, dbg> &other) {
+    for (std::size_t i = 0; i < other.map_.size(); ++i) {
+      if (other.map_.empty())
+        continue;
+
+      auto &d = try_emplace(other.map_[i].name, Data{});
+      d.min = std::min(other.map_[i].data.min, d.min);
+      d.max = std::max(other.map_[i].data.max, d.max);
+      d.sum += other.map_[i].data.sum;
+      d.count += other.map_[i].data.count;
+    }
+  }
+
 private:
   std::array<KV, BUCKETS> map_{};
   std::size_t size_{0};
@@ -291,7 +308,7 @@ void do_unmap(void *ptr, size_t size) {
     panic("err munmap");
 }
 
-void do_madvise(void* ptr, size_t size, int adv) {
+void do_madvise(void *ptr, size_t size, int adv) {
   const int ret = ::madvise(ptr, size, adv);
   if (ret < 0)
     panic("err madvise");
@@ -300,10 +317,9 @@ void do_madvise(void* ptr, size_t size, int adv) {
 class MMappedFile {
 public:
   MMappedFile(const char *file)
-      : fd_(do_open(file)), size_(get_size(fd_))
-      , ptr_(do_mmap(fd_, size_, PROT_READ, MAP_PRIVATE))
-  {
-    do_madvise(ptr_, size_, MADV_SEQUENTIAL | MADV_HUGEPAGE);
+      : fd_(do_open(file)), size_(get_size(fd_)),
+        ptr_(do_mmap(fd_, size_, PROT_READ, MAP_PRIVATE)) {
+    do_madvise(ptr_, size_, MADV_RANDOM | MADV_HUGEPAGE);
   }
 
   ~MMappedFile() {
@@ -385,25 +401,103 @@ static_assert(parse_value(test4).l == 5);
 
 } // namespace
 
-int main() {
-  MMappedFile f(DATA);
-  void* res_ptr = do_mmap(-1, sizeof(Result), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON);
-  do_madvise(res_ptr, sizeof(Result), MADV_HUGEPAGE);
-  auto* stats = new (res_ptr) Result();
-
-  const char *ptr = static_cast<const char *>(f.ptr());
-  for (int64_t space = f.size(); space > 0;) {
-    const char *n = static_cast<const char *>(std::memchr(ptr, DELIM, space));
+void process_batch(Result &r, const char *begin, std::size_t size) {
+  for (int64_t space = size; space > 0;) {
+    const char *n = static_cast<const char *>(std::memchr(begin, DELIM, space));
     const auto [val, len] = parse_value(n + 1);
-    const auto name = std::string_view(ptr, std::distance(ptr, n));
-    update_result(*stats, name, val);
+    const auto name = std::string_view(begin, std::distance(begin, n));
+    update_result(r, name, val);
 
-    space -= std::distance(ptr, n) + 1 + len + 1;
-    ptr = (n + 1 + len + 1);
+    space -= std::distance(begin, n) + 1 + len + 1;
+    begin = (n + 1 + len + 1);
+  }
+}
+
+using FileChunks = std::vector<std::pair<const char *, std::size_t>>;
+
+
+FileChunks split_into_chunks(const char *begin, std::size_t size,
+                  std::size_t min_chunk_size) {
+  const char *start = begin;
+  std::size_t size_left = size;
+  FileChunks chunks;
+  chunks.reserve((size + min_chunk_size - 1) / min_chunk_size);
+
+  while (size_left > 0) {
+    const std::size_t chunk_size = std::min(min_chunk_size, size_left);
+    const char *end = start + chunk_size;
+    const char *true_end = static_cast<const char *>(
+        std::memchr(end, NEW_LINE, size_left - chunk_size));
+    true_end = true_end == nullptr ? end : true_end;
+    const std::size_t true_size =
+        std::distance(start, true_end) + (true_end != end);
+    chunks.emplace_back(start, true_size);
+
+    start += true_size;
+    size_left -= true_size;
+  }
+  return chunks;
+}
+
+void set_cpu_affinity(int cpu) {
+  cpu_set_t cpu_set;
+  CPU_ZERO(&cpu_set);
+  CPU_SET(cpu, &cpu_set);
+  auto self = pthread_self();
+  const int ret = pthread_setaffinity_np(self, sizeof(cpu_set), &cpu_set);
+  if (ret < 0)
+    panic("err cpu affinity");
+}
+
+static constexpr std::size_t CHUNK = 10 * 1024 * 1024; // 10 Mb
+static constexpr std::size_t WORKERS = 15;
+
+void worker_routine(const FileChunks& chunks, Result& r, std::atomic<std::size_t>& next_chunk, int idx) {
+  set_cpu_affinity(idx);
+  std::size_t cur_chunk = idx;
+  const std::size_t n_chunks = chunks.size();
+  while (cur_chunk < n_chunks) {
+    const auto [begin, size] = chunks[cur_chunk];
+    process_batch(r, begin, size);
+    cur_chunk = next_chunk.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+Result run_workers(std::size_t workers_count, const char *f_begin,
+                   std::size_t f_size) {
+
+  std::vector<std::thread> workers;
+  workers.reserve(workers_count);
+  std::vector<Result> results;
+  results.resize(workers_count);
+
+  auto chunks = split_into_chunks(f_begin, f_size, CHUNK);
+  std::atomic<std::size_t> next_chunk{workers_count+1};
+
+  for (std::size_t i = 0; i < workers_count; ++i) {
+    workers.push_back(std::thread([&, i]() {
+      worker_routine(chunks, results[i], next_chunk, i);
+    }));
   }
 
-  print_results(*stats);
-  delete stats;
-  do_unmap(res_ptr, sizeof(Result));
+  Result r{};
+  worker_routine(chunks, r, next_chunk, workers_count);
+
+  for (std::size_t i = 0; i < workers_count; ++i) {
+    workers[i].join();
+    r.merge(results[i]);
+  }
+  return r;
+}
+
+int main() {
+  MMappedFile f(DATA);
+
+  const char *ptr = static_cast<const char *>(f.ptr());
+  const std::size_t space = f.size();
+
+  const auto stats = run_workers(WORKERS, ptr, space);
+  print_results(stats);
+
   return 0;
 }

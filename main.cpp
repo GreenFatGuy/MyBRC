@@ -175,13 +175,6 @@ public:
     const std::size_t h = Hash()(name);
     std::size_t s = idx(h);
     for (std::size_t i = 0; i < BUCKETS; ++i) {
-      if (map_[s].name == name) [[likely]] {
-        if constexpr (DEBUG)
-          hops_[i]++;
-
-        return map_[s].data;
-      }
-
       if (map_[s].name.empty()) [[likely]] {
         if constexpr (DEBUG)
           hops_[i]++;
@@ -191,6 +184,15 @@ public:
         ++size_;
         return map_[s].data;
       }
+
+      if (map_[s].name == name) [[likely]] {
+        if constexpr (DEBUG)
+          hops_[i]++;
+
+        return map_[s].data;
+      }
+
+
 
       s = idx(s + 1);
     }
@@ -221,7 +223,7 @@ public:
   template <bool dbg>
   void merge(const MyFlatHashMap<BUCKETS, Hash, dbg> &other) {
     for (std::size_t i = 0; i < other.map_.size(); ++i) {
-      if (other.map_.empty())
+      if (other.map_[i].name.empty())
         continue;
 
       auto &d = try_emplace(other.map_[i].name, Data{});
@@ -319,7 +321,7 @@ public:
   MMappedFile(const char *file)
       : fd_(do_open(file)), size_(get_size(fd_)),
         ptr_(do_mmap(fd_, size_, PROT_READ, MAP_PRIVATE)) {
-    do_madvise(ptr_, size_, MADV_RANDOM | MADV_HUGEPAGE);
+    do_madvise(ptr_, size_, MADV_SEQUENTIAL | MADV_WILLNEED | MADV_HUGEPAGE);
   }
 
   ~MMappedFile() {

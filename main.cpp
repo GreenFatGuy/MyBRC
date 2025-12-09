@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
+#include <immintrin.h>
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -62,9 +63,28 @@ struct fnv8a {
       s += 8;
       n -= 8;
     }
-    for (std::size_t i = n & 7; i > 0; --i) {
-      h ^= static_cast<uint8_t>(*s++);
-      h *= 1099511628211ull;
+    switch (n & 7) {
+      case 7:
+        h ^= static_cast<uint8_t>(*s++);
+        h *= 1099511628211ull;
+      case 6:
+        h ^= static_cast<uint8_t>(*s++);
+        h *= 1099511628211ull;
+      case 5:
+        h ^= static_cast<uint8_t>(*s++);
+        h *= 1099511628211ull;
+      case 4:
+        h ^= static_cast<uint8_t>(*s++);
+        h *= 1099511628211ull;
+      case 3:
+        h ^= static_cast<uint8_t>(*s++);
+        h *= 1099511628211ull;
+      case 2:
+        h ^= static_cast<uint8_t>(*s++);
+        h *= 1099511628211ull;
+      case 1:
+        h ^= static_cast<uint8_t>(*s++);
+        h *= 1099511628211ull;
     }
     return h;
   }
@@ -318,9 +338,12 @@ void do_madvise(void *ptr, size_t size, int adv) {
 
 class MMappedFile {
 public:
+  // Note: we mmap a 128bytes more. Because line is 100 + 1 + 5 + 1 = 107 bytes at max.
+  // So we would read with SIMD by 128 bytes blocks (actually 2 * 64) without SIGSEGV.
+  // Reading those extra bytes is legal (writing not), and they are zeros.
   MMappedFile(const char *file)
       : fd_(do_open(file)), size_(get_size(fd_)),
-        ptr_(do_mmap(fd_, size_, PROT_READ, MAP_PRIVATE)) {
+        ptr_(do_mmap(fd_, size_ + 128, PROT_READ, MAP_PRIVATE)) {
     do_madvise(ptr_, size_, MADV_SEQUENTIAL | MADV_WILLNEED | MADV_HUGEPAGE);
   }
 
@@ -403,9 +426,59 @@ static_assert(parse_value(test4).l == 5);
 
 } // namespace
 
+enum class Flavour {
+    MEMCHR,
+    AVX2,
+    AVX512,
+};
+
+template <Flavour F>
+const char* find_next_byte_128(const char* ptr, char c) {
+    if constexpr (F == Flavour::MEMCHR) {
+      return static_cast<const char *>(std::memchr(ptr, c, 128l));
+    } else if constexpr (F == Flavour::AVX2) {
+        const __m256i needle = _mm256_set1_epi8(c);
+        for (std::size_t offset = 0; offset < 128; offset += 32) {
+            const __m256i chunk = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr + offset));
+            const __m256i cmp = _mm256_cmpeq_epi8(chunk, needle);
+            const uint32_t mask = static_cast<uint32_t>(_mm256_movemask_epi8(cmp));
+            if (mask) [[ likely ]] {
+                const std::size_t bit_index = _tzcnt_u32(mask);
+                return ptr + offset + bit_index;
+            }
+        }
+        return nullptr;
+    } else if constexpr (F == Flavour::AVX512) {
+        const __m512i needle = _mm512_set1_epi8(c);
+        for (int offset = 0; offset < 128; offset += 64) {
+            const __m512i chunk = _mm512_loadu_si512(reinterpret_cast<const void*>(ptr + offset));
+            const __mmask64 mask = _mm512_cmpeq_epi8_mask(chunk, needle);
+            if (mask) [[ likely ]] {
+                const unsigned bit_index = static_cast<unsigned>(_tzcnt_u64(mask));
+                return ptr + offset + bit_index;
+            }
+        }
+        return nullptr;
+    } else {
+        static_assert(false);
+    }
+}
+
+constexpr Flavour current_flavour() {
+    // Note: MEMCHR currently better, stick with it
+    return Flavour::MEMCHR;
+#ifdef __AVX512F__
+    return Flavour::AVX512;
+#endif
+#ifdef __AVX2__
+    return Flavour::AVX2;
+#endif
+    return Flavour::MEMCHR;
+}
+
 void process_batch(Result &r, const char *begin, std::size_t size) {
   for (int64_t space = size; space > 0;) {
-    const char *n = static_cast<const char *>(std::memchr(begin, DELIM, space));
+    const char *n = find_next_byte_128<current_flavour()>(begin, DELIM);
     const auto [val, len] = parse_value(n + 1);
     const auto name = std::string_view(begin, std::distance(begin, n));
     update_result(r, name, val);
@@ -452,9 +525,9 @@ void set_cpu_affinity(int cpu) {
 }
 
 static constexpr std::size_t CHUNK = 10 * 1024 * 1024; // 10 Mb
-static constexpr std::size_t WORKERS = 15;
+//static constexpr std::size_t WORKERS = 15;
 
-void worker_routine(const FileChunks& chunks, Result& r, std::atomic<std::size_t>& next_chunk, int idx) {
+ __attribute_noinline__ void worker_routine(const FileChunks& chunks, Result& r, std::atomic<std::size_t>& next_chunk, int idx) {
   set_cpu_affinity(idx);
   std::size_t cur_chunk = idx;
   const std::size_t n_chunks = chunks.size();
@@ -498,7 +571,9 @@ int main() {
   const char *ptr = static_cast<const char *>(f.ptr());
   const std::size_t space = f.size();
 
-  const auto stats = run_workers(WORKERS, ptr, space);
+//  const auto stats = run_workers(WORKERS, ptr, space);
+  Result stats{};
+  process_batch(stats, ptr, space);
   print_results(stats);
 
   return 0;

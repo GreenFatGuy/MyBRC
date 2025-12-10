@@ -18,7 +18,8 @@ Best Java is actually 4th in scoreboard. It does not uses GraalVM. I don't have 
 This is Serkan OZAL solution. In scorepoard timing is 00:01.880
 
 
- - baseline:    2:49.74
- - best Java:   0:02.62
- - my solution: 0:06.50
+ - baseline (???):   2:49.74
+ - best Java (mt):   0:02.62
+ - my solution (st): 0:10.81
+ - my solution (mt): 0:06.50
 

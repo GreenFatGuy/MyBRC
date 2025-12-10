@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -8,7 +9,9 @@
 #include <iostream>
 #include <limits>
 #include <string_view>
+#include <span>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -25,19 +28,81 @@ static constexpr char DELIM = ';';
 static constexpr char NEW_LINE = '\n';
 // static constexpr int MAX_NAMES = 10'000;
 
+//#define DBG 1
+
+#ifdef DBG
+#define DBG_NOINLINE __attribute_noinline__ 
+#else
+#define DBG_NOINLINE
+#endif
+
+template <std::size_t Size>
+struct DWordStr {
+    static_assert(Size > 0);
+
+    ~DWordStr() { if (ptr != nullptr) delete[] ptr; }
+    uint64_t dwords[Size];
+    const char* ptr = nullptr;
+
+    constexpr bool is_small() const noexcept {
+      return ptr == nullptr;
+    }
+
+    constexpr bool operator==(const DWordStr& other) const noexcept {
+      const uint8_t m = static_cast<uint8_t>(is_small() << 0) &
+                        static_cast<uint8_t>(other.is_small() << 1);
+      switch (m) {
+        [[likely]] case 0b11: {
+          bool eq = true;
+#pragma unroll
+          for (std::size_t i = 0; i < Size; ++i)
+            eq &= !(dwords[i] ^ other.dwords[i]);
+          return eq;
+        }
+        case 0b10:
+            [[fallthrough]];
+        case 0b01:
+            return false;
+        case 0b00:
+            return dwords[0] == dwords[1] && (std::memcmp(ptr, other.ptr, dwords[0]) == 0);
+      }
+      __builtin_unreachable();
+    }
+};
+
 template <typename H> struct HashWrapper {
   constexpr std::size_t operator()(const std::string &s) const noexcept {
     return H::hash(s.data(), s.size());
   }
 
-  constexpr std::size_t operator()(const std::string_view &s) const noexcept {
+  constexpr std::size_t operator()(std::string_view s) const noexcept {
     return H::hash(s.data(), s.size());
   }
 
   constexpr std::size_t operator()(const char *s) const noexcept {
     return this->operator()(std::string_view(s));
   }
+
+  constexpr std::size_t operator()(std::span<const char> s) const noexcept {
+    return H::hash(s.data(), s.size());
+  }
+
+  template <std::size_t Size>
+  constexpr std::size_t operator()(const DWordStr<Size>& str) const noexcept {
+    if (str.is_small) [[ likely ]] {
+      // Basically fnv8a
+      std::size_t h = 14695981039346656037ull;
+#pragma unroll
+      for (std::size_t i = 0; i < Size; ++i)
+        h ^= str.dwords * 14695981039346656037ull;
+      return h; 
+    } else {
+      return H::hash(str.ptr, str.dwords[0]);
+    }
+  }
 };
+
+
 
 struct fnv1a {
   static constexpr std::size_t hash(const char *s, std::size_t n) noexcept {
@@ -188,31 +253,31 @@ public:
 
   struct KV {
     std::string name;
-    Data data;
+    std::size_t size;
+    Data data{};
   };
 
-  Data &try_emplace(std::string_view name, Data &&v) {
+  DBG_NOINLINE Data &try_emplace(std::span<const char> name) {
     const std::size_t h = Hash()(name);
     std::size_t s = idx(h);
     for (std::size_t i = 0; i < BUCKETS; ++i) {
-      if (map_[s].name.empty()) [[likely]] {
+      auto& e = map_[s]; 
+      if (e.size == name.size() && (std::memcmp(name.data(), e.name.data(), e.size) == 0)) [[likely]] {
         if constexpr (DEBUG)
           hops_[i]++;
 
-        map_[s].name = std::string(name);
-        map_[s].data = std::forward<Data>(v);
+        return map_[s].data;
+      }
+
+      if (e.name.empty()) {
+        if constexpr (DEBUG)
+          hops_[i]++;
+
+        e.name = std::string(std::string_view(name.data(), name.size()));
+        e.size = name.size();
         ++size_;
-        return map_[s].data;
+        return e.data;
       }
-
-      if (map_[s].name == name) [[likely]] {
-        if constexpr (DEBUG)
-          hops_[i]++;
-
-        return map_[s].data;
-      }
-
-
 
       s = idx(s + 1);
     }
@@ -246,7 +311,7 @@ public:
       if (other.map_[i].name.empty())
         continue;
 
-      auto &d = try_emplace(other.map_[i].name, Data{});
+      auto &d = try_emplace(other.map_[i].name);
       d.min = std::min(other.map_[i].data.min, d.min);
       d.max = std::max(other.map_[i].data.max, d.max);
       d.sum += other.map_[i].data.sum;
@@ -282,8 +347,8 @@ void print_results(const Result &r) {
   r.print_stats();
 }
 
-void update_result(Result &r, std::string_view name, int16_t t) {
-  auto &s = r.try_emplace(name, Data{});
+void update_result(Result &r, std::span<const char> name, int16_t t) {
+  auto &s = r.try_emplace(name);
 
   s.max = std::max(t, s.max);
   s.min = std::min(t, s.min);
@@ -366,7 +431,7 @@ struct temp {
   int8_t l;
 };
 
-constexpr temp parse_value(const char *d) {
+constexpr DBG_NOINLINE temp parse_value(const char *d) {
   // 4 possible cases:
   // 1. 1.2
   // 2. -1.2
@@ -476,42 +541,63 @@ constexpr Flavour current_flavour() {
     return Flavour::MEMCHR;
 }
 
-void process_batch(Result &r, const char *begin, std::size_t size) {
-  for (int64_t space = size; space > 0;) {
-    const char *n = find_next_byte_128<current_flavour()>(begin, DELIM);
-    const auto [val, len] = parse_value(n + 1);
-    const auto name = std::string_view(begin, std::distance(begin, n));
-    update_result(r, name, val);
-
-    space -= std::distance(begin, n) + 1 + len + 1;
-    begin = (n + 1 + len + 1);
-  }
-}
-
-using FileChunks = std::vector<std::pair<const char *, std::size_t>>;
 
 
-FileChunks split_into_chunks(const char *begin, std::size_t size,
-                  std::size_t min_chunk_size) {
-  const char *start = begin;
-  std::size_t size_left = size;
+using FileChunks = std::vector<std::span<const char>>;
+
+
+FileChunks split_into_chunks(std::span<const char> mem, std::size_t min_chunk_size) {
   FileChunks chunks;
-  chunks.reserve((size + min_chunk_size - 1) / min_chunk_size);
+  chunks.reserve((mem.size() + min_chunk_size - 1) / min_chunk_size);
 
-  while (size_left > 0) {
-    const std::size_t chunk_size = std::min(min_chunk_size, size_left);
-    const char *end = start + chunk_size;
+  while (!mem.empty()) {
+    const std::size_t chunk_size = std::min(min_chunk_size, mem.size());
     const char *true_end = static_cast<const char *>(
-        std::memchr(end, NEW_LINE, size_left - chunk_size));
-    true_end = true_end == nullptr ? end : true_end;
-    const std::size_t true_size =
-        std::distance(start, true_end) + (true_end != end);
-    chunks.emplace_back(start, true_size);
+        std::memchr(&mem[chunk_size], NEW_LINE, mem.size() - chunk_size));
+    const std::size_t true_size = true_end == nullptr
+        ? chunk_size
+        : std::distance(mem.data(), true_end) + 1;
+    chunks.emplace_back(mem.data(), true_size);
 
-    start += true_size;
-    size_left -= true_size;
+
+    mem = mem.subspan(true_size);
+    //std::cerr << "Chunk: from=" << (uintptr_t)mem.data() << ", size=" << true_size << ", left=" << mem.size() << "\n";
   }
   return chunks;
+}
+
+DBG_NOINLINE void process_batch(Result &r, std::span<const char> batch) {
+
+  constexpr std::size_t Mb = 1 << 20; 
+  constexpr std::size_t unroll = 4;
+
+  auto chunks = split_into_chunks(batch, 4*Mb);
+  // round up to 8
+  std::bitset<unroll> flag;
+  std::array<std::size_t, unroll> idxs = []<auto... I>(std::index_sequence<I...>) {
+    return std::array<std::size_t, unroll>{I...};
+  }(std::make_index_sequence<unroll>());
+
+  while (!flag.all()) {
+#pragma unroll
+    for (std::size_t j = 0; j < unroll; j++) {
+      if (idxs[j] >= chunks.size()) [[unlikely]] {
+        flag.set(j);
+        continue;
+      }
+
+      auto& chunk = chunks[idxs[j]];
+      const char *n = static_cast<const char *>(std::memchr(chunk.data(), DELIM, chunks.size()));
+      const std::size_t name_len = std::distance(chunk.data(), n);
+      const auto [val, len] = parse_value(n + 1);
+
+      const auto name = std::span<const char>(chunk.data(), name_len);
+      update_result(r, name, val);
+      chunk = chunk.subspan(name_len + 1 + len + 1);
+
+      idxs[j] = chunk.empty() ? idxs[j] + unroll : idxs[j];
+    }
+  }
 }
 
 void set_cpu_affinity(int cpu) {
@@ -527,13 +613,12 @@ void set_cpu_affinity(int cpu) {
 static constexpr std::size_t CHUNK = 10 * 1024 * 1024; // 10 Mb
 //static constexpr std::size_t WORKERS = 15;
 
- __attribute_noinline__ void worker_routine(const FileChunks& chunks, Result& r, std::atomic<std::size_t>& next_chunk, int idx) {
+ DBG_NOINLINE void worker_routine(const FileChunks& chunks, Result& r, std::atomic<std::size_t>& next_chunk, int idx) {
   set_cpu_affinity(idx);
   std::size_t cur_chunk = idx;
   const std::size_t n_chunks = chunks.size();
   while (cur_chunk < n_chunks) {
-    const auto [begin, size] = chunks[cur_chunk];
-    process_batch(r, begin, size);
+    process_batch(r, chunks[cur_chunk]);
     cur_chunk = next_chunk.fetch_add(1, std::memory_order_relaxed);
   }
 }
@@ -546,7 +631,7 @@ Result run_workers(std::size_t workers_count, const char *f_begin,
   std::vector<Result> results;
   results.resize(workers_count);
 
-  auto chunks = split_into_chunks(f_begin, f_size, CHUNK);
+  auto chunks = split_into_chunks(std::span<const char>(f_begin, f_size), CHUNK);
   std::atomic<std::size_t> next_chunk{workers_count+1};
 
   for (std::size_t i = 0; i < workers_count; ++i) {
@@ -571,10 +656,13 @@ int main() {
   const char *ptr = static_cast<const char *>(f.ptr());
   const std::size_t space = f.size();
 
-//  const auto stats = run_workers(WORKERS, ptr, space);
-  Result stats{};
-  process_batch(stats, ptr, space);
-  print_results(stats);
+  void* rptr = do_mmap(-1, sizeof(Result), PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE);
+  do_madvise(rptr, sizeof(Result), MADV_WILLNEED | MADV_HUGEPAGE);
+  Result* stats = new (rptr) Result();
+  process_batch(*stats, std::span<const char>(ptr, space));
+  print_results(*stats);
+  stats->~Result();
+  do_unmap(rptr, sizeof(Result));
 
   return 0;
 }

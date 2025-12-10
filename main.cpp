@@ -607,7 +607,7 @@ void set_cpu_affinity(int cpu) {
 }
 
 static constexpr std::size_t CHUNK = 32 * 1024 * 1024; // 32 Mb
-// static constexpr std::size_t WORKERS = 15;
+static constexpr std::size_t WORKERS = 15;
 
 DBG_NOINLINE void worker_routine(const FileChunks &chunks, Result &r,
                                  std::atomic<std::size_t> &next_chunk,
@@ -647,13 +647,13 @@ Result run_workers(std::size_t workers_count, std::span<const char> file) {
 }
 
 int main() {
-  MMappedFile f(DATA);
+  MMappedFile file(DATA);
 
-  const char *ptr = static_cast<const char *>(f.ptr());
-  const std::size_t space = f.size();
+  auto file_mem = std::span<const char>(static_cast<const char *>(file.ptr()), file.size());
 
-  Result stats;
-  process_batch(stats, std::span<const char>(ptr, space));
+  // Result stats;
+  //process_batch(stats, file_mem);
+  auto stats = run_workers(WORKERS, file_mem);
   print_results(stats);
 
   return 0;

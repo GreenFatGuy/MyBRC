@@ -113,13 +113,15 @@ template <std::size_t Size> struct DWordStr {
   }
 
   std::string to_string() const {
-    if (is_small()) {
-      return std::string(
-          std::string_view(reinterpret_cast<const char *>(dwords.data()),
-                           Size * sizeof(uint64_t)));
-    } else {
-      return std::string(std::string_view(ptr, dwords[0]));
-    }
+    auto [str_ptr, size] = [this]() -> std::tuple<const char *, std::size_t> {
+      if (is_small()) {
+        return {reinterpret_cast<const char *>(dwords.data()),
+                Size * sizeof(uint64_t)};
+      } else {
+        return {ptr, dwords[0]};
+      }
+    }();
+    return std::string(std::string_view(str_ptr, size));
   }
 };
 
@@ -179,16 +181,8 @@ struct fnv8a {
   }
 };
 
-using FNV8A = HashWrapper<fnv8a>;
-
-struct Data {
-  int16_t min = std::numeric_limits<int16_t>::max();
-  int16_t max = std::numeric_limits<int16_t>::min();
-  uint32_t count = 0;
-  int64_t sum = 0;
-};
-
-template <std::size_t BUCKETS, typename Hash = FNV8A, bool DEBUG = false>
+template <std::size_t BUCKETS, typename Key, typename Value, typename Hash,
+          bool DEBUG = false>
 class MyFlatHashMap {
 public:
   static_assert((BUCKETS & (BUCKETS - 1)) == 0, "BUCKETS must be a power of 2");
@@ -196,29 +190,33 @@ public:
   static constexpr auto idx = [](std::size_t h) { return h & (BUCKETS - 1); };
 
   struct KV {
-    DWordStr<2> name{};
-    Data data{};
+    Key key{};
+    Value value{};
   };
 
-  DBG_NOINLINE Data &try_emplace(DWordStr<2> &&name) {
-    const std::size_t h = Hash()(name);
+  constexpr std::size_t size() const noexcept { return size_; }
+
+  constexpr bool empty() const noexcept { return size_ == 0; }
+
+  DBG_NOINLINE Value &try_emplace(Key &&key) {
+    const std::size_t h = Hash()(key);
     std::size_t s = idx(h);
     for (std::size_t i = 0; i < BUCKETS; ++i) {
       auto &e = map_[s];
-      if (e.name == name) [[likely]] {
+      if (e.key == key) [[likely]] {
         if constexpr (DEBUG)
           hops_[i]++;
-        return map_[s].data;
+        return map_[s].value;
       }
 
-      if (e.name.empty()) {
+      if (e.key.empty()) {
 
         if constexpr (DEBUG)
           hops_[i]++;
 
-        e.name = std::forward<DWordStr<2>>(name);
+        e.key = std::forward<Key>(key);
         ++size_;
-        return e.data;
+        return e.value;
       }
 
       s = idx(s + 1);
@@ -226,40 +224,21 @@ public:
     __builtin_unreachable();
   }
 
-  std::vector<std::pair<std::string, Data>> to_plain() const {
-    std::vector<std::pair<std::string, Data>> v;
-    v.reserve(size_);
+  template <typename F> void for_each(F &&f) const {
     for (const auto &kv : map_) {
-      if (!kv.name.empty())
-        v.emplace_back(kv.name.to_string(), kv.data);
+      if (!kv.key.empty())
+        f(kv);
     }
-    std::sort(v.begin(), v.end(),
-              [](auto &a, auto &b) { return a.first < b.first; });
-    return v;
   }
 
   void print_stats() const {
-    std::cout << "Result stats:\n";
-    for (std::size_t i = 0; i < hops_.size(); ++i) {
-      if (hops_[i] == 0)
-        continue;
-      std::cout << "hops[" << i << "] = " << hops_[i] << "\n";
-    }
-  }
-
-  template <bool dbg>
-  void merge(const MyFlatHashMap<BUCKETS, Hash, dbg> &other) {
-    for (std::size_t i = 0; i < other.map_.size(); ++i) {
-      if (other.map_[i].name.empty())
-        continue;
-
-      // TODO: this is very stupid, but does not matter so much
-      auto cpy = other.map_[i].name;
-      auto &d = try_emplace(std::move(cpy));
-      d.min = std::min(other.map_[i].data.min, d.min);
-      d.max = std::max(other.map_[i].data.max, d.max);
-      d.sum += other.map_[i].data.sum;
-      d.count += other.map_[i].data.count;
+    if constexpr (DEBUG) {
+      std::cout << "Result stats:\n";
+      for (std::size_t i = 0; i < hops_.size(); ++i) {
+        if (hops_[i] == 0)
+          continue;
+        std::cout << "hops[" << i << "] = " << hops_[i] << "\n";
+      }
     }
   }
 
@@ -269,13 +248,47 @@ private:
   std::array<std::size_t, BUCKETS> hops_{};
 };
 
-using Result = MyFlatHashMap<32768, FNV8A, true>;
+using FNV8A = HashWrapper<fnv8a>;
+
+struct Data {
+  int16_t min = std::numeric_limits<int16_t>::max();
+  int16_t max = std::numeric_limits<int16_t>::min();
+  uint32_t count = 0;
+  int64_t sum = 0;
+};
+
+using Name = DWordStr<2>;
+
+using Result = MyFlatHashMap<32768, Name, Data, FNV8A, true>;
+
+void merge(Result &left, const Result &right) {
+  right.for_each([&](const Result::KV &kv) {
+    // TODO: this is very stupid, but does not matter so much
+    auto cpy = kv.key;
+    auto &d = left.try_emplace(std::move(cpy));
+    d.min = std::min(kv.value.min, d.min);
+    d.max = std::max(kv.value.max, d.max);
+    d.sum += kv.value.sum;
+    d.count += kv.value.count;
+  });
+}
+
+std::vector<std::pair<std::string, Data>> to_plain(const Result &r) {
+  std::vector<std::pair<std::string, Data>> v;
+  v.reserve(r.size());
+  r.for_each([&](const Result::KV &kv) {
+    v.emplace_back(kv.key.to_string(), kv.value);
+  });
+  std::sort(v.begin(), v.end(),
+            [](auto &a, auto &b) { return a.first < b.first; });
+  return v;
+}
 
 void print_results(const Result &r) {
   std::cout << std::fixed << std::setprecision(1) << "{";
   bool first = true;
 
-  auto v = r.to_plain();
+  auto v = to_plain(r);
 
   for (auto &&[name, data] : v) {
     if (!first)
@@ -477,7 +490,7 @@ template <Flavour F> const char *find_next_byte_128(const char *ptr, char c) {
 }
 
 constexpr Flavour current_flavour() {
-  // Note: MEMCHR currently better, stick with it
+  // Note: MEMCHR is currently better that all my SIMD tries, stick with it
   return Flavour::MEMCHR;
 #ifdef __AVX512F__
   return Flavour::AVX512;
@@ -551,7 +564,7 @@ NameParseRes parse_name_simd_reg(const char *ptr) {
     res.name.dwords[1] &= masks[1];
     // Fallback for longer name
   } else {
-    const char *n = static_cast<const char *>(std::memchr(ptr, DELIM, 128));
+    const char *n = find_next_byte_128<current_flavour()>(ptr, DELIM);
     res.len = std::distance(ptr, n);
     res.name.dwords[0] = res.len;
     // TODO: this is actually not neccessary here
@@ -606,9 +619,6 @@ void set_cpu_affinity(int cpu) {
     panic("err cpu affinity");
 }
 
-static constexpr std::size_t CHUNK = 32 * 1024 * 1024; // 32 Mb
-static constexpr std::size_t WORKERS = 15;
-
 DBG_NOINLINE void worker_routine(const FileChunks &chunks, Result &r,
                                  std::atomic<std::size_t> &next_chunk,
                                  int idx) {
@@ -622,10 +632,11 @@ DBG_NOINLINE void worker_routine(const FileChunks &chunks, Result &r,
 }
 
 Result run_workers(std::size_t workers_count, std::span<const char> file) {
+  static constexpr std::size_t CHUNK = 32 * 1024 * 1024; // 32 Mb
 
   std::vector<std::thread> workers;
-  workers.reserve(workers_count);
   std::vector<Result> results;
+  workers.reserve(workers_count);
   results.resize(workers_count);
 
   auto chunks = split_into_chunks(file, CHUNK);
@@ -641,19 +652,30 @@ Result run_workers(std::size_t workers_count, std::span<const char> file) {
 
   for (std::size_t i = 0; i < workers_count; ++i) {
     workers[i].join();
-    r.merge(results[i]);
+    merge(r, results[i]);
   }
   return r;
 }
 
+static constexpr bool MULTITHREADED = true;
+static constexpr std::size_t WORKERS = 15;
+
 int main() {
   MMappedFile file(DATA);
 
-  auto file_mem = std::span<const char>(static_cast<const char *>(file.ptr()), file.size());
+  auto file_mem =
+      std::span<const char>(static_cast<const char *>(file.ptr()), file.size());
 
-  // Result stats;
-  //process_batch(stats, file_mem);
-  auto stats = run_workers(WORKERS, file_mem);
+  auto stats = [&]() {
+    if constexpr (MULTITHREADED) {
+      return run_workers(WORKERS, file_mem);
+    } else {
+      Result stats;
+      process_batch(stats, file_mem);
+      return stats;
+    }
+  }();
+
   print_results(stats);
 
   return 0;

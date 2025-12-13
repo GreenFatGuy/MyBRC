@@ -26,9 +26,10 @@
 static constexpr char DATA[] = "measurements.txt";
 static constexpr char DELIM = ';';
 static constexpr char NEW_LINE = '\n';
-// static constexpr int MAX_NAMES = 10'000;
+static constexpr std::size_t Kb = 1 << 10;
+static constexpr std::size_t Mb = Kb << 10;
 
-// #define DBG 1
+#define DBG 1
 
 #ifdef DBG
 #define DBG_NOINLINE __attribute_noinline__
@@ -36,25 +37,25 @@ static constexpr char NEW_LINE = '\n';
 #define DBG_NOINLINE
 #endif
 
-template <std::size_t Size> struct DWordStr {
+template <std::size_t Size> struct QWordStr {
   std::array<uint64_t, Size> dwords{};
   const char *ptr = nullptr;
 
   static_assert(Size > 0);
 
-  DWordStr() { std::memset(dwords.data(), 0, sizeof(uint64_t) * Size); }
+  QWordStr() { std::memset(dwords.data(), 0, sizeof(uint64_t) * Size); }
 
-  ~DWordStr() {
+  ~QWordStr() {
     if (ptr != nullptr)
       delete ptr;
   }
 
-  DWordStr(DWordStr &&other) {
+  QWordStr(QWordStr &&other) {
     dwords = other.dwords;
     std::swap(ptr, other.ptr);
   }
 
-  DWordStr(const DWordStr &other) {
+  QWordStr(const QWordStr &other) {
     dwords = other.dwords;
     if (!other.is_small()) {
       char *ptr = new char[other.dwords[0]];
@@ -63,18 +64,18 @@ template <std::size_t Size> struct DWordStr {
     }
   }
 
-  DWordStr &operator=(DWordStr &&other) {
+  QWordStr &operator=(QWordStr &&other) {
     if (this != &other) {
-      this->~DWordStr();
+      this->~QWordStr();
       dwords = other.dwords;
       ptr = std::exchange(other.ptr, nullptr);
     }
     return *this;
   }
 
-  DWordStr &operator=(const DWordStr &other) {
+  QWordStr &operator=(const QWordStr &other) {
     if (this != &other) {
-      this->~DWordStr();
+      this->~QWordStr();
       dwords = other.dwords;
       if (!other.is_small()) {
         char *ptr = new char[other.dwords[0]];
@@ -89,7 +90,7 @@ template <std::size_t Size> struct DWordStr {
 
   constexpr bool empty() const noexcept { return dwords[0] == 0; }
 
-  constexpr bool operator==(const DWordStr &other) const noexcept {
+  constexpr DBG_NOINLINE bool operator==(const QWordStr &other) const noexcept {
     const uint8_t m = (static_cast<uint8_t>(is_small()) << 0) |
                       (static_cast<uint8_t>(other.is_small()) << 1);
     switch (m) {
@@ -143,26 +144,40 @@ template <typename H> struct HashWrapper {
   }
 
   template <std::size_t Size>
-  constexpr std::size_t operator()(const DWordStr<Size> &str) const noexcept {
-    if (str.is_small()) [[likely]] {
-      // Basically fnv8a
-      std::size_t h = 0;
-#pragma unroll
-      for (std::size_t i = 0; i < Size; ++i) {
-        h ^= str.dwords[i];
-      }
-      h *= 14695981039346656037ull;
-      h >>= 35;
-      return h;
-    } else {
-      return H::hash(str.ptr, str.dwords[0]);
-    }
+  constexpr std::size_t operator()(const QWordStr<Size> &str) const noexcept {
+    return H::template hash<Size>(str);
   }
 };
 
-struct fnv8a {
+struct MyHash {
+// Note: this is combination of fnv1a for qwords and murmur bits entanglment
+// But I use fnv1a without multiplication:
+// standard fnv1a is:
+//  h = start_offset;
+//  for 1b in bytes:
+//    h ^= b;
+//    h *= prime
+//  return h
+//
+// my fnv1a is:
+//  h = start_offset;
+//  for 8b in bytes:
+//    h ^= b;
+//  return murmur64(h)
+//
+// On given data this produces perfect hash if taken by modulo 65536
+
+  static constexpr std::size_t murmur64(std::size_t h) noexcept {
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ull;
+    h ^= h >> 33;
+    return h;
+  }
+
   static constexpr std::size_t hash(const char *s, std::size_t n) noexcept {
-    uint64_t h = 0;
+    uint64_t h = 0xcbf29ce484222325ull;
     for (std::size_t i = n; i >= 8; i -= 8) {
       uint64_t w = 0;
       std::memcpy(&w, s, sizeof(w));
@@ -170,14 +185,25 @@ struct fnv8a {
       s += 8;
       n -= 8;
     }
-    if (n > 0) {
-      uint64_t w = 0;
-      std::memcpy(&w, s, n);
-      h ^= w;
+    uint64_t w = 0;
+    std::memcpy(&w, s, n);
+    h ^= w;
+    return murmur64(h);
+  }
+
+  template <std::size_t Size>
+  static constexpr std::size_t hash(const QWordStr<Size> &str) noexcept {
+    if (str.is_small()) [[likely]] {
+      // Basically fnv8a
+      std::size_t h = 0xcbf29ce484222325ull;
+#pragma unroll
+      for (std::size_t i = 0; i < Size; ++i) {
+        h ^= str.dwords[i];
+      }
+      return murmur64(h);
+    } else {
+      return hash(str.ptr, str.dwords[0]);
     }
-    h *= 14695981039346656037ull;
-    h >>= 35;
-    return h;
   }
 };
 
@@ -248,7 +274,7 @@ private:
   std::array<std::size_t, BUCKETS> hops_{};
 };
 
-using FNV8A = HashWrapper<fnv8a>;
+using Hash = HashWrapper<MyHash>;
 
 struct Data {
   int16_t min = std::numeric_limits<int16_t>::max();
@@ -257,9 +283,9 @@ struct Data {
   int64_t sum = 0;
 };
 
-using Name = DWordStr<2>;
+using Name = QWordStr<2>;
 
-using Result = MyFlatHashMap<32768, Name, Data, FNV8A, true>;
+using Result = MyFlatHashMap<65536, Name, Data, Hash, true>;
 
 void merge(Result &left, const Result &right) {
   right.for_each([&](const Result::KV &kv) {
@@ -304,8 +330,8 @@ void print_results(const Result &r) {
   r.print_stats();
 }
 
-void update_result(Result &r, DWordStr<2> &&name, int16_t t) {
-  auto &s = r.try_emplace(std::forward<DWordStr<2>>(name));
+void update_result(Result &r, QWordStr<2> &&name, int16_t t) {
+  auto &s = r.try_emplace(std::forward<QWordStr<2>>(name));
 
   s.max = std::max(t, s.max);
   s.min = std::min(t, s.min);
@@ -529,7 +555,7 @@ FileChunks split_into_chunks(std::span<const char> mem,
 }
 
 struct NameParseRes {
-  DWordStr<2> name;
+  QWordStr<2> name;
   uint8_t len;
 };
 
@@ -576,35 +602,41 @@ NameParseRes parse_name_simd_reg(const char *ptr) {
   return res;
 }
 
+template <std::size_t UNROLL = 8, std::size_t CHUNK = 2 * Mb>
 DBG_NOINLINE void process_batch(Result &r, std::span<const char> batch) {
+  if constexpr (UNROLL > 1) {
+    auto chunks = split_into_chunks(batch, 2 * Mb);
+    std::bitset<UNROLL> all_finished{0};
+    std::array<std::size_t, UNROLL> idxs =
+        []<auto... I>(std::index_sequence<I...>) {
+          return std::array<std::size_t, UNROLL>{I...};
+        }(std::make_index_sequence<UNROLL>());
 
-  constexpr std::size_t Mb = 1 << 20;
-  constexpr std::size_t unroll = 4;
+    while (!all_finished.all()) {
 
-  auto chunks = split_into_chunks(batch, 4 * Mb);
-  std::bitset<unroll> all_finished;
-  std::array<std::size_t, unroll> idxs =
-      []<auto... I>(std::index_sequence<I...>) {
-        return std::array<std::size_t, unroll>{I...};
-      }(std::make_index_sequence<unroll>());
-
-  while (!all_finished.all()) {
 #pragma unroll
-    for (std::size_t j = 0; j < unroll; j++) {
-      if (idxs[j] >= chunks.size()) [[unlikely]] {
-        all_finished.set(j);
-        continue;
+      for (std::size_t j = 0; j < UNROLL; j++) {
+        if (idxs[j] >= chunks.size()) [[unlikely]] {
+          all_finished.set(j);
+          continue;
+        }
+
+        auto &chunk = chunks[idxs[j]];
+
+        auto [name, name_len] = parse_name_simd_reg(chunk.data());
+        auto [val, val_len] = parse_value(&chunk[name_len + 1]);
+        update_result(r, std::move(name), val);
+        chunk = chunk.subspan(name_len + 1 + val_len + 1);
+
+        idxs[j] = chunk.empty() ? idxs[j] + UNROLL : idxs[j];
       }
-
-      auto &chunk = chunks[idxs[j]];
-
-      auto [name, name_len] = parse_name_simd_reg(chunk.data());
-      auto [val, val_len] = parse_value(&chunk[name_len + 1]);
-
+    }
+  } else {
+    while (!batch.empty()) {
+      auto [name, name_len] = parse_name_simd_reg(batch.data());
+      auto [val, val_len] = parse_value(&batch[name_len + 1]);
       update_result(r, std::move(name), val);
-
-      chunk = chunk.subspan(name_len + 1 + val_len + 1);
-      idxs[j] = chunk.empty() ? idxs[j] + unroll : idxs[j];
+      batch = batch.subspan(name_len + 1 + val_len + 1);
     }
   }
 }
@@ -620,9 +652,9 @@ void set_cpu_affinity(int cpu) {
 }
 
 DBG_NOINLINE void worker_routine(const FileChunks &chunks, Result &r,
-                                 std::atomic<std::size_t> &next_chunk,
-                                 int idx) {
-  set_cpu_affinity(idx);
+                                 std::atomic<std::size_t> &next_chunk, int idx,
+                                 int cpu) {
+  set_cpu_affinity(cpu);
   std::size_t cur_chunk = idx;
   const std::size_t n_chunks = chunks.size();
   while (cur_chunk < n_chunks) {
@@ -631,47 +663,64 @@ DBG_NOINLINE void worker_routine(const FileChunks &chunks, Result &r,
   }
 }
 
-Result run_workers(std::size_t workers_count, std::span<const char> file) {
-  static constexpr std::size_t CHUNK = 32 * 1024 * 1024; // 32 Mb
-
+template <std::size_t WORKERS, std::size_t UNROLL, std::size_t UNROLL_CHUNK,
+          std::size_t WORKER_CHUNK>
+Result run_workers(std::span<const char> file,
+                   std::span<const int, WORKERS> cpus) {
   std::vector<std::thread> workers;
   std::vector<Result> results;
-  workers.reserve(workers_count);
-  results.resize(workers_count);
+  workers.reserve(WORKERS);
+  results.resize(WORKERS);
 
-  auto chunks = split_into_chunks(file, CHUNK);
-  std::atomic<std::size_t> next_chunk{workers_count + 1};
+  auto chunks = split_into_chunks(file, WORKER_CHUNK);
+  std::atomic<std::size_t> next_chunk{WORKERS + 1};
 
-  for (std::size_t i = 0; i < workers_count; ++i) {
-    workers.push_back(std::thread(
-        [&, i]() { worker_routine(chunks, results[i], next_chunk, i); }));
+  for (std::size_t i = 0; i < WORKERS; ++i) {
+    workers.push_back(std::thread([&, i]() {
+      worker_routine(chunks, results[i], next_chunk, i, cpus[i]);
+    }));
   }
 
   Result r{};
-  worker_routine(chunks, r, next_chunk, workers_count);
+  worker_routine(chunks, r, next_chunk, WORKERS, 0);
 
-  for (std::size_t i = 0; i < workers_count; ++i) {
+  for (std::size_t i = 0; i < WORKERS; ++i) {
     workers[i].join();
     merge(r, results[i]);
   }
   return r;
 }
 
-static constexpr bool MULTITHREADED = true;
-static constexpr std::size_t WORKERS = 15;
+
+static constexpr std::array<int, 13> CPUS = {1,  3,  6,  8,  10, 12, 13,
+                                                  14, 15, 17, 19, 20, 21};
+static constexpr std::size_t WORKERS = 13;
+static_assert(WORKERS <= CPUS.size());
+static constexpr std::size_t PARALLEL_CHUNK = 64 * Mb;
+static constexpr std::size_t UNROLL_CHUNK = 4 * Mb;
+static constexpr std::size_t UNROLL = 4;
+
+auto run_mt(auto &&...args) {
+  return run_workers<WORKERS, UNROLL, UNROLL_CHUNK, PARALLEL_CHUNK>(args...);
+}
+
+auto run_st(auto &&...args) {
+  return process_batch<UNROLL, UNROLL_CHUNK>(args...);
+};
 
 int main() {
-  MMappedFile file(DATA);
+  static constexpr bool MULTITHREADED = false;
 
+  MMappedFile file(DATA);
   auto file_mem =
       std::span<const char>(static_cast<const char *>(file.ptr()), file.size());
 
   auto stats = [&]() {
     if constexpr (MULTITHREADED) {
-      return run_workers(WORKERS, file_mem);
+      return run_mt(file_mem, std::span<const int, WORKERS>(CPUS.cbegin(), WORKERS));
     } else {
       Result stats;
-      process_batch(stats, file_mem);
+      run_st(stats, file_mem);
       return stats;
     }
   }();

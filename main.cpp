@@ -29,7 +29,7 @@ static constexpr char NEW_LINE = '\n';
 static constexpr std::size_t Kb = 1 << 10;
 static constexpr std::size_t Mb = Kb << 10;
 
-#define DBG 1
+// #define DBG
 
 #ifdef DBG
 #define DBG_NOINLINE __attribute_noinline__
@@ -116,8 +116,12 @@ template <std::size_t Size> struct QWordStr {
   std::string to_string() const {
     auto [str_ptr, size] = [this]() -> std::tuple<const char *, std::size_t> {
       if (is_small()) {
-        return {reinterpret_cast<const char *>(dwords.data()),
-                Size * sizeof(uint64_t)};
+        const auto *data = reinterpret_cast<const char *>(dwords.data());
+        const std::size_t max_size = Size * sizeof(uint64_t);
+        std::size_t len = 0;
+        while (len < max_size && data[len] != '\0')
+          ++len;
+        return {data, len};
       } else {
         return {ptr, dwords[0]};
       }
@@ -150,22 +154,6 @@ template <typename H> struct HashWrapper {
 };
 
 struct MyHash {
-// Note: this is combination of fnv1a for qwords and murmur bits entanglment
-// But I use fnv1a without multiplication:
-// standard fnv1a is:
-//  h = start_offset;
-//  for 1b in bytes:
-//    h ^= b;
-//    h *= prime
-//  return h
-//
-// my fnv1a is:
-//  h = start_offset;
-//  for 8b in bytes:
-//    h ^= b;
-//  return murmur64(h)
-//
-// On given data this produces perfect hash if taken by modulo 65536
 
   static constexpr std::size_t murmur64(std::size_t h) noexcept {
     h ^= h >> 33;
@@ -285,7 +273,7 @@ struct Data {
 
 using Name = QWordStr<2>;
 
-using Result = MyFlatHashMap<65536, Name, Data, Hash, true>;
+using Result = MyFlatHashMap<65536, Name, Data, Hash>;
 
 void merge(Result &left, const Result &right) {
   right.for_each([&](const Result::KV &kv) {
@@ -559,42 +547,55 @@ struct NameParseRes {
   uint8_t len;
 };
 
-NameParseRes parse_name_simd_reg(const char *ptr) {
+#define KEEP_MASK(len) ((__uint128_t(1) << ((len) << 3)) - 1)
+#define KEEP_MASK_UP(len) (static_cast<uint64_t>(KEEP_MASK(len) >> 64))
+#define KEEP_MASK_LOW(len) (static_cast<uint64_t>(KEEP_MASK(len)))
+
+
+NameParseRes parse_name_simd_reg(const char* __restrict__ ptr) {
   static_assert(DELIM == 0x3B);
-  constexpr uint64_t MASK1 = 0x0101010101010101ull;
-  constexpr uint64_t MASK2 = 0x8080808080808080ull;
-  constexpr uint64_t DELIM_MASK = MASK1 * DELIM;
+  static constexpr uint64_t KEEP_MASK[16][2] = {
+    {0, 0},
+    {KEEP_MASK_LOW(1), KEEP_MASK_UP(1)},
+    {KEEP_MASK_LOW(2), KEEP_MASK_UP(2)},
+    {KEEP_MASK_LOW(3), KEEP_MASK_UP(3)},
+    {KEEP_MASK_LOW(4), KEEP_MASK_UP(4)},
+    {KEEP_MASK_LOW(5), KEEP_MASK_UP(5)},
+    {KEEP_MASK_LOW(6), KEEP_MASK_UP(6)},
+    {KEEP_MASK_LOW(7), KEEP_MASK_UP(7)},
+    {KEEP_MASK_LOW(8), KEEP_MASK_UP(8)},
+    {KEEP_MASK_LOW(9), KEEP_MASK_UP(9)},
+    {KEEP_MASK_LOW(10), KEEP_MASK_UP(10)},
+    {KEEP_MASK_LOW(11), KEEP_MASK_UP(11)},
+    {KEEP_MASK_LOW(12), KEEP_MASK_UP(12)},
+    {KEEP_MASK_LOW(13), KEEP_MASK_UP(13)},
+    {KEEP_MASK_LOW(14), KEEP_MASK_UP(14)},
+    {KEEP_MASK_LOW(15), KEEP_MASK_UP(15)},
+  };
   NameParseRes res{};
-  std::memcpy(res.name.dwords.data(), ptr,
-              sizeof(uint64_t) * res.name.dwords.size());
 
-  std::array<uint64_t, 2> masks{res.name.dwords[0] ^ DELIM_MASK,
-                                res.name.dwords[1] ^ DELIM_MASK};
+  const __m128i chunk =
+      _mm_loadu_si128(reinterpret_cast<const __m128i *>(ptr));
+  const __m128i delim_vec = _mm_set1_epi8(DELIM);
+  const uint32_t mask =
+      static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, delim_vec)));
 
-  masks[0] = (masks[0] - MASK1) & ~masks[0] & MASK2;
-  masks[1] = (masks[1] - MASK1) & ~masks[1] & MASK2;
+  if (mask) [[likely]] {
+    const uint32_t len = std::countr_zero(mask);
+    res.len = static_cast<uint8_t>(len);
 
-  // Note: DELIM is in first 16 bytes
-  if ((masks[0] | masks[1]) != 0) [[likely]] {
-    const uint64_t is_in_second = (masks[0] == 0);
-    masks[0] = static_cast<uint64_t>(__builtin_ctzll(masks[0]) >> 3),
-    masks[1] = static_cast<uint64_t>((0x40 + __builtin_ctzll(masks[1])) >> 3);
-    res.len = masks[is_in_second];
+    std::memcpy(res.name.dwords.data(), ptr,
+                sizeof(uint64_t) * res.name.dwords.size());
 
-    __uint128_t keep128 = (static_cast<__uint128_t>(1) << (res.len << 3)) - 1;
+    res.name.dwords[0] &= KEEP_MASK[len][0];
+    res.name.dwords[1] &= KEEP_MASK[len][1];
+    // std::cerr << "len: " << static_cast<int>(len) << ", mask: " << mask << ", keep: " << KEEP_MASK[len][0] << ", " << KEEP_MASK[len][1] << "\n";
+    // std::cerr << "name: |" << res.name.to_string() << "|\n";
 
-    masks[0] = static_cast<uint64_t>(keep128);
-    masks[1] = static_cast<uint64_t>(keep128 >> 64);
-
-    res.name.dwords[0] &= masks[0];
-    res.name.dwords[1] &= masks[1];
-    // Fallback for longer name
   } else {
     const char *n = find_next_byte_128<current_flavour()>(ptr, DELIM);
-    res.len = std::distance(ptr, n);
+    res.len = static_cast<uint8_t>(std::distance(ptr, n));
     res.name.dwords[0] = res.len;
-    // TODO: this is actually not neccessary here
-    //       but DWordStrView type needed;
     char *new_ptr = new char[res.len];
     std::memcpy(new_ptr, ptr, res.len);
     res.name.ptr = new_ptr;
@@ -709,7 +710,7 @@ auto run_st(auto &&...args) {
 };
 
 int main() {
-  static constexpr bool MULTITHREADED = false;
+  static constexpr bool MULTITHREADED = true;
 
   MMappedFile file(DATA);
   auto file_mem =

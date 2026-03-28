@@ -364,7 +364,7 @@ public:
   }
 
   ~MMappedFile() {
-    do_unmap(ptr_, size_);
+    do_unmap(ptr_, size_ + EXTRA_PAD);
     do_close(fd_);
   }
 

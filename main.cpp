@@ -593,7 +593,7 @@ NameParseRes parse_name_simd(const char* __restrict__ ptr) {
 template <std::size_t UNROLL = 8, std::size_t CHUNK = 2 * Mb>
 DBG_NOINLINE void process_batch(Result &r, Chunk batch) {
   if constexpr (UNROLL > 1) {
-    auto chunks = split_into_chunks(batch, 2 * Mb);
+    auto chunks = split_into_chunks(batch, CHUNK);
     std::bitset<UNROLL> all_finished{0};
     std::array<std::size_t, UNROLL> idxs =
         []<auto... I>(std::index_sequence<I...>) {
@@ -629,7 +629,7 @@ DBG_NOINLINE void process_batch(Result &r, Chunk batch) {
       update_result(r, std::move(name), val);
       const std::size_t len = name_len + 1 + val_len + 1; 
       batch.data += len;
-      batch.data -= len;
+      batch.size -= len;
     }
   }
 }
@@ -644,6 +644,7 @@ void set_cpu_affinity(int cpu) {
     panic("err cpu affinity");
 }
 
+template <std::size_t UNROLL = 8, std::size_t CHUNK = 2 * Mb>
 DBG_NOINLINE void worker_routine(const FileChunks &chunks, Result &r,
                                  std::atomic<std::size_t> &next_chunk, int idx,
                                  int cpu) {
@@ -651,7 +652,7 @@ DBG_NOINLINE void worker_routine(const FileChunks &chunks, Result &r,
   std::size_t cur_chunk = idx;
   const std::size_t n_chunks = chunks.size();
   while (cur_chunk < n_chunks) {
-    process_batch(r, chunks[cur_chunk]);
+    process_batch<UNROLL, CHUNK>(r, chunks[cur_chunk]);
     cur_chunk = next_chunk.fetch_add(1, std::memory_order_relaxed);
   }
 }
@@ -671,7 +672,7 @@ Result run_workers(std::span<const char> file,
 
   for (std::size_t i = 0; i < WORKERS; ++i) {
     workers.push_back(std::thread([&, i]() {
-      worker_routine(chunks, results[i], next_chunk, i, cpus[i]);
+      worker_routine<UNROLL, UNROLL_CHUNK>(chunks, results[i], next_chunk, i, cpus[i]);
     }));
   }
 
@@ -691,8 +692,8 @@ static constexpr std::array<int, 13> CPUS = {1,  3,  6,  8,  10, 12, 13,
 static constexpr std::size_t WORKERS = 13;
 static_assert(WORKERS <= CPUS.size());
 static constexpr std::size_t PARALLEL_CHUNK = 64 * Mb;
-static constexpr std::size_t UNROLL_CHUNK = 4 * Mb;
-static constexpr std::size_t UNROLL = 4;
+static constexpr std::size_t UNROLL_CHUNK = 2 * Mb;
+static constexpr std::size_t UNROLL = 8;
 
 auto run_mt(auto &&...args) {
   return run_workers<WORKERS, UNROLL, UNROLL_CHUNK, PARALLEL_CHUNK>(args...);

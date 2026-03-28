@@ -37,6 +37,51 @@ static constexpr std::size_t Mb = Kb << 10;
 #define DBG_NOINLINE
 #endif
 
+void panic(const char *err) {
+  std::cerr << err << "\n";
+  std::terminate();
+}
+
+int do_open(const char *file) {
+  const int ret = ::open(file, O_RDONLY);
+  if (ret < 0)
+    panic("err open file");
+  return ret;
+}
+
+void do_close(int fd) {
+  int ret = ::close(fd);
+  if (ret < 0)
+    panic("err close file");
+}
+
+size_t get_size(int fd) {
+  struct stat stat;
+  const int ret = ::fstat(fd, &stat);
+  if (ret < 0)
+    panic("err fstat");
+  return stat.st_size;
+}
+
+void *do_mmap(int fd, size_t size, int opt, int flag) {
+  void *ptr = ::mmap(nullptr, size, opt, flag, fd, 0);
+  if (ptr == MAP_FAILED)
+    panic("err mmap");
+  return ptr;
+}
+
+void do_unmap(void *ptr, size_t size) {
+  const int ret = ::munmap(ptr, size);
+  if (ret < 0)
+    panic("err munmap");
+}
+
+void do_madvise(void *ptr, size_t size, int adv) {
+  const int ret = ::madvise(ptr, size, adv);
+  if (ret < 0)
+    panic("err madvise");
+}
+
 struct DoubleQWordStr {
   static constexpr uint8_t TAG_BIG = 0xFF;
   static constexpr uint8_t TAG_SMALL = 0x00;
@@ -200,14 +245,20 @@ public:
   static_assert(BUCKETS > 0, "BUCKETS must be greater than 0");
   static constexpr auto idx = [](std::size_t h) { return h & (BUCKETS - 1); };
 
+  MyFlatHashMap() : map_(nullptr) {
+    auto *ptr = do_mmap(-1, BUCKETS * sizeof(KV), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE);
+    map_ = static_cast<KV*>(ptr);
+  }
+
+  ~MyFlatHashMap() {
+    if (map_)
+      do_unmap(map_, sizeof(KV) * BUCKETS);
+  }
+
   struct KV {
     Key key{};
     Value value{};
   };
-
-  constexpr std::size_t size() const noexcept { return size_; }
-
-  constexpr bool empty() const noexcept { return size_ == 0; }
 
   DBG_NOINLINE Value &try_emplace(Key &&key) {
     const std::size_t h = Hash()(key);
@@ -215,18 +266,11 @@ public:
     for (std::size_t i = 0; i < BUCKETS; ++i) {
       auto &e = map_[s];
       if (e.key == key) [[likely]] {
-        if constexpr (DEBUG)
-          hops_[i]++;
         return map_[s].value;
       }
 
       if (e.key.empty()) {
-
-        if constexpr (DEBUG)
-          hops_[i]++;
-
         e.key = std::forward<Key>(key);
-        ++size_;
         return e.value;
       }
 
@@ -236,27 +280,14 @@ public:
   }
 
   template <typename F> void for_each(F &&f) const {
-    for (const auto &kv : map_) {
-      if (!kv.key.empty())
-        f(kv);
-    }
-  }
-
-  void print_stats() const {
-    if constexpr (DEBUG) {
-      std::cout << "Result stats:\n";
-      for (std::size_t i = 0; i < hops_.size(); ++i) {
-        if (hops_[i] == 0)
-          continue;
-        std::cout << "hops[" << i << "] = " << hops_[i] << "\n";
-      }
+    for (int i = 0; i < BUCKETS; ++i) {
+      if (!map_[i].key.empty())
+        f(map_[i]);
     }
   }
 
 private:
-  std::array<KV, BUCKETS> map_{};
-  std::size_t size_{0};
-  std::array<std::size_t, BUCKETS> hops_{};
+  KV* map_;
 };
 
 using Hash = HashWrapper<MyHash>;
@@ -285,7 +316,7 @@ void merge(Result &left, const Result &right) {
 
 std::vector<std::pair<std::string, Data>> to_plain(const Result &r) {
   std::vector<std::pair<std::string, Data>> v;
-  v.reserve(r.size());
+  v.reserve(10000);
   r.for_each([&](const Result::KV &kv) {
     v.emplace_back(kv.key.to_string(), kv.value);
   });
@@ -310,8 +341,6 @@ void print_results(const Result &r) {
     first = false;
   }
   std::cout << "}\n";
-
-  r.print_stats();
 }
 
 void update_result(Result &r, DoubleQWordStr &&name, int16_t t) {
@@ -323,50 +352,7 @@ void update_result(Result &r, DoubleQWordStr &&name, int16_t t) {
   s.sum += t;
 }
 
-void panic(const char *err) {
-  std::cerr << err << "\n";
-  std::terminate();
-}
 
-int do_open(const char *file) {
-  const int ret = ::open(file, O_RDONLY);
-  if (ret < 0)
-    panic("err open file");
-  return ret;
-}
-
-void do_close(int fd) {
-  int ret = ::close(fd);
-  if (ret < 0)
-    panic("err close file");
-}
-
-size_t get_size(int fd) {
-  struct stat stat;
-  const int ret = ::fstat(fd, &stat);
-  if (ret < 0)
-    panic("err fstat");
-  return stat.st_size;
-}
-
-void *do_mmap(int fd, size_t size, int opt, int flag) {
-  void *ptr = ::mmap(nullptr, size, opt, flag, fd, 0);
-  if (ptr == MAP_FAILED)
-    panic("err mmap");
-  return ptr;
-}
-
-void do_unmap(void *ptr, size_t size) {
-  const int ret = ::munmap(ptr, size);
-  if (ret < 0)
-    panic("err munmap");
-}
-
-void do_madvise(void *ptr, size_t size, int adv) {
-  const int ret = ::madvise(ptr, size, adv);
-  if (ret < 0)
-    panic("err madvise");
-}
 
 class MMappedFile {
 public:

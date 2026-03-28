@@ -37,78 +37,81 @@ static constexpr std::size_t Mb = Kb << 10;
 #define DBG_NOINLINE
 #endif
 
-template <std::size_t Size> struct QWordStr {
-  std::array<uint64_t, Size> dwords{};
-  const char *ptr = nullptr;
+struct DoubleQWordStr {
+  static constexpr uint8_t TAG_BIG = 0xFF;
+  static constexpr uint8_t TAG_SMALL = 0x00;
+  static constexpr uint64_t BIG_SIZE_MASK = 0x00FFFFFFFFFFFFFF;
 
-  static_assert(Size > 0);
+  union {
+      std::array<uint64_t, 2> small{};
+      uint8_t raw[16];
+      struct {
+        const char* str;
+        std::size_t size;
+      } big;
+    } data;
 
-  QWordStr() { std::memset(dwords.data(), 0, sizeof(uint64_t) * Size); }
+  DoubleQWordStr() { std::memset(&data, 0, sizeof(data)); }
 
-  ~QWordStr() {
-    if (ptr != nullptr)
-      delete ptr;
+  ~DoubleQWordStr() {
+    if (!is_small() && data.big.str != nullptr)
+      delete[] data.big.str;
   }
 
-  QWordStr(QWordStr &&other) {
-    dwords = other.dwords;
-    std::swap(ptr, other.ptr);
+  DoubleQWordStr(DoubleQWordStr &&other) {
+    std::memcpy(&data, &other.data, sizeof(data));
+    other.data.big.str = nullptr;
   }
 
-  QWordStr(const QWordStr &other) {
-    dwords = other.dwords;
+  DoubleQWordStr(const DoubleQWordStr &other) {
+    char* ptr = nullptr;
     if (!other.is_small()) {
-      char *ptr = new char[other.dwords[0]];
-      std::memcpy(ptr, other.ptr, other.dwords[0]);
-      this->ptr = ptr;
+      const std::size_t size = other.big_size();
+      ptr = new char[size];
+      std::memcpy(ptr, other.data.big.str, size);
     }
+    std::memcpy(&data, &other.data, sizeof(data));
+    if (ptr != nullptr)
+      data.big.str = ptr;
   }
 
-  QWordStr &operator=(QWordStr &&other) {
+  DoubleQWordStr &operator=(DoubleQWordStr &&other) {
     if (this != &other) {
-      this->~QWordStr();
-      dwords = other.dwords;
-      ptr = std::exchange(other.ptr, nullptr);
+      this->~DoubleQWordStr();
+      new (this) DoubleQWordStr(std::forward<DoubleQWordStr>(other));
     }
     return *this;
   }
 
-  QWordStr &operator=(const QWordStr &other) {
+  DoubleQWordStr &operator=(const DoubleQWordStr &other) {
     if (this != &other) {
-      this->~QWordStr();
-      dwords = other.dwords;
-      if (!other.is_small()) {
-        char *ptr = new char[other.dwords[0]];
-        std::memcpy(ptr, other.ptr, other.dwords[0]);
-        this->ptr = ptr;
-      }
+      this->~DoubleQWordStr();
+      new (this) DoubleQWordStr(other);
     }
     return *this;
   }
 
-  constexpr bool is_small() const noexcept { return ptr == nullptr; }
+  constexpr bool is_small() const noexcept { return data.raw[15] == TAG_SMALL; }
 
-  constexpr bool empty() const noexcept { return dwords[0] == 0; }
+  constexpr bool empty() const noexcept { return data.small[0] == 0; }
 
-  constexpr DBG_NOINLINE bool operator==(const QWordStr &other) const noexcept {
+  constexpr std::size_t big_size() const noexcept { return data.big.size & BIG_SIZE_MASK; }
+
+  constexpr DBG_NOINLINE bool operator==(const DoubleQWordStr &other) const noexcept {
     const uint8_t m = (static_cast<uint8_t>(is_small()) << 0) |
                       (static_cast<uint8_t>(other.is_small()) << 1);
     switch (m) {
     [[likely]] case 0b11: {
-      bool eq = true;
-#pragma unroll
-      for (std::size_t i = 0; i < Size; ++i)
-        eq &= !(dwords[i] ^ other.dwords[i]);
-      return eq;
+      return static_cast<uint8_t>(!(data.small[0] ^ other.data.small[0])) &
+             static_cast<uint8_t>(!(data.small[1] ^ other.data.small[1]));
     }
     case 0b10:
       [[fallthrough]];
     case 0b01:
       return false;
-    case 0b00: {
-      return (dwords[0] == other.dwords[0]) &&
-             (std::memcmp(ptr, other.ptr, dwords[0]) == 0);
-    }
+    case 0b00:
+      return (data.big.size == other.data.big.size) &&
+             (std::memcmp(data.big.str, other.data.big.str, big_size()) == 0);
     }
     __builtin_unreachable();
   }
@@ -116,14 +119,12 @@ template <std::size_t Size> struct QWordStr {
   std::string to_string() const {
     auto [str_ptr, size] = [this]() -> std::tuple<const char *, std::size_t> {
       if (is_small()) {
-        const auto *data = reinterpret_cast<const char *>(dwords.data());
-        const std::size_t max_size = Size * sizeof(uint64_t);
         std::size_t len = 0;
-        while (len < max_size && data[len] != '\0')
+        while (len < sizeof(data.raw) && data.raw[len] != '\0')
           ++len;
-        return {data, len};
+        return {reinterpret_cast<const char*>(data.raw), len};
       } else {
-        return {ptr, dwords[0]};
+        return {data.big.str, big_size()};
       }
     }();
     return std::string(std::string_view(str_ptr, size));
@@ -147,9 +148,8 @@ template <typename H> struct HashWrapper {
     return H::hash(s.data(), s.size());
   }
 
-  template <std::size_t Size>
-  constexpr std::size_t operator()(const QWordStr<Size> &str) const noexcept {
-    return H::template hash<Size>(str);
+  constexpr std::size_t operator()(const DoubleQWordStr &str) const noexcept {
+    return H::hash(str);
   }
 };
 
@@ -179,18 +179,15 @@ struct MyHash {
     return murmur64(h);
   }
 
-  template <std::size_t Size>
-  static constexpr std::size_t hash(const QWordStr<Size> &str) noexcept {
+  static constexpr std::size_t hash(const DoubleQWordStr &str) noexcept {
     if (str.is_small()) [[likely]] {
       // Basically fnv8a
       std::size_t h = 0xcbf29ce484222325ull;
-#pragma unroll
-      for (std::size_t i = 0; i < Size; ++i) {
-        h ^= str.dwords[i];
-      }
+      h ^= str.data.small[0];
+      h ^= str.data.small[1];
       return murmur64(h);
     } else {
-      return hash(str.ptr, str.dwords[0]);
+      return hash(str.data.big.str, str.big_size());
     }
   }
 };
@@ -271,9 +268,8 @@ struct Data {
   int64_t sum = 0;
 };
 
-using Name = QWordStr<2>;
-
-using Result = MyFlatHashMap<65536, Name, Data, Hash>;
+using Result = MyFlatHashMap<65536, DoubleQWordStr, Data, Hash>;
+static_assert(sizeof(Result::KV) == 32);
 
 void merge(Result &left, const Result &right) {
   right.for_each([&](const Result::KV &kv) {
@@ -318,8 +314,8 @@ void print_results(const Result &r) {
   r.print_stats();
 }
 
-void update_result(Result &r, QWordStr<2> &&name, int16_t t) {
-  auto &s = r.try_emplace(std::forward<QWordStr<2>>(name));
+void update_result(Result &r, DoubleQWordStr &&name, int16_t t) {
+  auto &s = r.try_emplace(std::forward<DoubleQWordStr>(name));
 
   s.max = std::max(t, s.max);
   s.min = std::min(t, s.min);
@@ -515,35 +511,41 @@ constexpr Flavour current_flavour() {
   return Flavour::MEMCHR;
 }
 
-using FileChunks = std::vector<std::span<const char>>;
+struct alignas(64) Chunk {
+    const char* data;
+    std::size_t size;
+};
 
-FileChunks split_into_chunks(std::span<const char> mem,
+using FileChunks = std::vector<Chunk>;
+
+FileChunks split_into_chunks(Chunk mem,
                              std::size_t chunk_size) {
   FileChunks chunks;
-  chunks.reserve((mem.size() + chunk_size - 1) / chunk_size);
+  chunks.reserve((mem.size + chunk_size - 1) / chunk_size);
   std::size_t next_chunk_size = chunk_size;
-  while (!mem.empty()) {
-    const std::size_t chunk_size = std::min(next_chunk_size, mem.size());
+  while (mem.size != 0) {
+    const std::size_t chunk_size = std::min(next_chunk_size, mem.size);
 
     const char *true_end = static_cast<const char *>(
-        std::memchr(&mem[chunk_size], NEW_LINE, mem.size() - chunk_size));
+        std::memchr(&mem.data[chunk_size], NEW_LINE, mem.size - chunk_size));
     const std::size_t true_size = true_end == nullptr
                                       ? chunk_size
-                                      : std::distance(mem.data(), true_end) + 1;
-    chunks.emplace_back(mem.data(), true_size);
+                                      : std::distance(mem.data, true_end) + 1;
+    chunks.emplace_back(mem.data, true_size);
     // Note: balancing chunks to preserve total size
     // - if true_size is equal to chunk size - next will be ~chunk_size
     // - if true_size is less than chunk size - next will be slightly greater
     // - if true_size is greater than chunk_size - netx will be slightly less
     next_chunk_size = 2 * chunk_size - true_size;
 
-    mem = mem.subspan(true_size);
+    mem.data += true_size;
+    mem.size -= true_size;
   }
   return chunks;
 }
 
 struct NameParseRes {
-  QWordStr<2> name;
+  DoubleQWordStr name;
   uint8_t len;
 };
 
@@ -552,7 +554,7 @@ struct NameParseRes {
 #define KEEP_MASK_LOW(len) (static_cast<uint64_t>(KEEP_MASK(len)))
 
 
-NameParseRes parse_name_simd_reg(const char* __restrict__ ptr) {
+NameParseRes parse_name_simd(const char* __restrict__ ptr) {
   static_assert(DELIM == 0x3B);
   static constexpr uint64_t KEEP_MASK[16][2] = {
     {0, 0},
@@ -584,27 +586,26 @@ NameParseRes parse_name_simd_reg(const char* __restrict__ ptr) {
     const uint32_t len = std::countr_zero(mask);
     res.len = static_cast<uint8_t>(len);
 
-    std::memcpy(res.name.dwords.data(), ptr,
-                sizeof(uint64_t) * res.name.dwords.size());
+    std::memcpy(res.name.data.small.data(), ptr,
+                2 * sizeof(uint64_t));
 
-    res.name.dwords[0] &= KEEP_MASK[len][0];
-    res.name.dwords[1] &= KEEP_MASK[len][1];
-    // std::cerr << "len: " << static_cast<int>(len) << ", mask: " << mask << ", keep: " << KEEP_MASK[len][0] << ", " << KEEP_MASK[len][1] << "\n";
-    // std::cerr << "name: |" << res.name.to_string() << "|\n";
-
+    res.name.data.small[0] &= KEEP_MASK[len][0];
+    res.name.data.small[1] &= KEEP_MASK[len][1];
+    res.name.data.raw[15] = DoubleQWordStr::TAG_SMALL;
   } else {
     const char *n = find_next_byte_128<current_flavour()>(ptr, DELIM);
     res.len = static_cast<uint8_t>(std::distance(ptr, n));
-    res.name.dwords[0] = res.len;
+    res.name.data.big.size = res.len;
     char *new_ptr = new char[res.len];
     std::memcpy(new_ptr, ptr, res.len);
-    res.name.ptr = new_ptr;
+    res.name.data.big.str = new_ptr;
+    res.name.data.raw[15] = DoubleQWordStr::TAG_BIG;
   }
   return res;
 }
 
 template <std::size_t UNROLL = 8, std::size_t CHUNK = 2 * Mb>
-DBG_NOINLINE void process_batch(Result &r, std::span<const char> batch) {
+DBG_NOINLINE void process_batch(Result &r, Chunk batch) {
   if constexpr (UNROLL > 1) {
     auto chunks = split_into_chunks(batch, 2 * Mb);
     std::bitset<UNROLL> all_finished{0};
@@ -624,20 +625,25 @@ DBG_NOINLINE void process_batch(Result &r, std::span<const char> batch) {
 
         auto &chunk = chunks[idxs[j]];
 
-        auto [name, name_len] = parse_name_simd_reg(chunk.data());
-        auto [val, val_len] = parse_value(&chunk[name_len + 1]);
+        auto [name, name_len] = parse_name_simd(chunk.data);
+        auto [val, val_len] = parse_value(&chunk.data[name_len + 1]);
         update_result(r, std::move(name), val);
-        chunk = chunk.subspan(name_len + 1 + val_len + 1);
 
-        idxs[j] = chunk.empty() ? idxs[j] + UNROLL : idxs[j];
+        const std::size_t len = name_len + 1 + val_len + 1;
+        chunk.data += len;
+        chunk.size -= len;
+
+        idxs[j] = chunk.size == 0 ? idxs[j] + UNROLL : idxs[j];
       }
     }
   } else {
-    while (!batch.empty()) {
-      auto [name, name_len] = parse_name_simd_reg(batch.data());
-      auto [val, val_len] = parse_value(&batch[name_len + 1]);
+    while (batch.size != 0) {
+      auto [name, name_len] = parse_name_simd(batch.data);
+      auto [val, val_len] = parse_value(&batch.data[name_len + 1]);
       update_result(r, std::move(name), val);
-      batch = batch.subspan(name_len + 1 + val_len + 1);
+      const std::size_t len = name_len + 1 + val_len + 1; 
+      batch.data += len;
+      batch.data -= len;
     }
   }
 }
@@ -673,8 +679,9 @@ Result run_workers(std::span<const char> file,
   workers.reserve(WORKERS);
   results.resize(WORKERS);
 
-  auto chunks = split_into_chunks(file, WORKER_CHUNK);
-  std::atomic<std::size_t> next_chunk{WORKERS + 1};
+  auto chunks = split_into_chunks(Chunk{file.data(), file.size()}, WORKER_CHUNK);
+
+  alignas(64) std::atomic<std::size_t> next_chunk{WORKERS + 1};
 
   for (std::size_t i = 0; i < WORKERS; ++i) {
     workers.push_back(std::thread([&, i]() {
@@ -705,12 +712,13 @@ auto run_mt(auto &&...args) {
   return run_workers<WORKERS, UNROLL, UNROLL_CHUNK, PARALLEL_CHUNK>(args...);
 }
 
-auto run_st(auto &&...args) {
-  return process_batch<UNROLL, UNROLL_CHUNK>(args...);
+auto run_st(std::span<const char> file, Result& r) {
+  Chunk c{file.data(), file.size()};
+  return process_batch<UNROLL, UNROLL_CHUNK>(r, c);
 };
 
 int main() {
-  static constexpr bool MULTITHREADED = true;
+  static constexpr bool MULTITHREADED = false;
 
   MMappedFile file(DATA);
   auto file_mem =
@@ -721,7 +729,7 @@ int main() {
       return run_mt(file_mem, std::span<const int, WORKERS>(CPUS.cbegin(), WORKERS));
     } else {
       Result stats;
-      run_st(stats, file_mem);
+      run_st(file_mem, stats);
       return stats;
     }
   }();

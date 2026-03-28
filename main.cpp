@@ -1,7 +1,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <bitset>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -592,44 +591,45 @@ NameParseRes parse_name_simd(const char* __restrict__ ptr) {
 
 template <std::size_t UNROLL = 8, std::size_t CHUNK = 2 * Mb>
 DBG_NOINLINE void process_batch(Result &r, Chunk batch) {
-  if constexpr (UNROLL > 1) {
-    auto chunks = split_into_chunks(batch, CHUNK);
-    std::bitset<UNROLL> all_finished{0};
-    std::array<std::size_t, UNROLL> idxs =
-        []<auto... I>(std::index_sequence<I...>) {
-          return std::array<std::size_t, UNROLL>{I...};
-        }(std::make_index_sequence<UNROLL>());
+  struct {
+    const char* begin;
+    const char* end;
+  } lanes[UNROLL];
 
-    while (!all_finished.all()) {
-
-#pragma unroll
-      for (std::size_t j = 0; j < UNROLL; j++) {
-        if (idxs[j] >= chunks.size()) [[unlikely]] {
-          all_finished.set(j);
-          continue;
-        }
-
-        auto &chunk = chunks[idxs[j]];
-
-        auto [name, name_len] = parse_name_simd(chunk.data);
-        auto [val, val_len] = parse_value(&chunk.data[name_len + 1]);
-        update_result(r, std::move(name), val);
-
-        const std::size_t len = name_len + 1 + val_len + 1;
-        chunk.data += len;
-        chunk.size -= len;
-
-        idxs[j] = chunk.size == 0 ? idxs[j] + UNROLL : idxs[j];
-      }
+  const std::size_t lane_size = batch.size / UNROLL;
+  const char *batch_end = batch.data + batch.size;
+  const char *ptr = batch.data;
+  for (int i = 0; i < UNROLL; ++i) {
+    lanes[i].begin = ptr;
+    if (i == UNROLL - 1) {
+      lanes[i].end = batch_end;
+      break;
     }
-  } else {
-    while (batch.size != 0) {
-      auto [name, name_len] = parse_name_simd(batch.data);
-      auto [val, val_len] = parse_value(&batch.data[name_len + 1]);
+    ptr += lane_size;
+    const char *end = static_cast<const char *>(
+        std::memchr(ptr, NEW_LINE, std::distance(ptr, batch_end)));
+    ptr = end == nullptr ? ptr : end + 1;
+    lanes[i].end = ptr;
+  }
+
+  uint64_t lanes_state = 0;
+  constexpr uint64_t ALL_DONE = (1ull << UNROLL) - 1;
+  static_assert(UNROLL < 64);
+  while (lanes_state != ALL_DONE) {
+#pragma unroll
+    for (std::size_t j = 0; j < UNROLL; j++) {
+      auto& lane = lanes[j];
+      if (lane.begin >= lane.end) [[unlikely]] {
+        lanes_state |= 1ull << j;
+        continue;
+      }
+
+      auto [name, name_len] = parse_name_simd(lane.begin);
+      auto [val, val_len] = parse_value(lane.begin + name_len + 1);
       update_result(r, std::move(name), val);
-      const std::size_t len = name_len + 1 + val_len + 1; 
-      batch.data += len;
-      batch.size -= len;
+
+      const std::size_t len = name_len + 1 + val_len + 1;
+      lane.begin += len;
     }
   }
 }
@@ -640,7 +640,7 @@ void set_cpu_affinity(int cpu) {
   CPU_SET(cpu, &cpu_set);
   auto self = pthread_self();
   const int ret = pthread_setaffinity_np(self, sizeof(cpu_set), &cpu_set);
-  if (ret < 0)
+  if (ret != 0)
     panic("err cpu affinity");
 }
 

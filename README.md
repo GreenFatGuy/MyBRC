@@ -21,5 +21,5 @@ This is Serkan OZAL solution. In scorepoard timing is 00:01.880
  - baseline (st):   2:49.74
  - best Java (mt):   0:01.18
  - my solution (st): 0:09.67
- - my solution (mt): 0:01.70
+ - my solution (mt): 0:01.54
 

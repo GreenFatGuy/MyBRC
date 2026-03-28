@@ -688,9 +688,9 @@ Result run_workers(std::span<const char> file,
   return r;
 }
 
-static constexpr std::array<int, 13> CPUS = {1,  3,  6,  8,  10, 12, 13,
-                                             14, 15, 17, 19, 20, 21};
-static constexpr std::size_t WORKERS = 13;
+static constexpr std::array<int, 21> CPUS = {1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11,
+                                             12, 13, 14, 15, 16, 17, 18, 19, 20, 21};
+static constexpr std::size_t WORKERS = 21;
 static_assert(WORKERS <= CPUS.size());
 static constexpr std::size_t PARALLEL_CHUNK = 64 * Mb;
 static constexpr std::size_t UNROLL_CHUNK = 2 * Mb;

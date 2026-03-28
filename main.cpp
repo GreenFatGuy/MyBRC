@@ -205,7 +205,7 @@ struct MyHash {
   static std::size_t hash(const char *s, std::size_t n) noexcept {
     __m128i h = _mm_set_epi64x(0xc4ceb9fe1a85ec53ull, 0xff51afd7ed558ccdull);
     while (n >= 16) {
-      __m128i v = _mm_load_si128(reinterpret_cast<const __m128i *>(s));
+      __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i *>(s));
       h = _mm_aesenc_si128(v, h);
       s += 16;
       n -= 16;
@@ -223,7 +223,7 @@ struct MyHash {
     if (str.is_small()) [[likely]] {
       const __m128i key =
           _mm_set_epi64x(0xc4ceb9fe1a85ec53ull, 0xff51afd7ed558ccdull);
-      __m128i v = _mm_load_si128(
+      __m128i v = _mm_loadu_si128(
           reinterpret_cast<const __m128i *>(str.data.small.data()));
       v = _mm_aesenc_si128(v, key);
       v = _mm_aesenc_si128(v, key);

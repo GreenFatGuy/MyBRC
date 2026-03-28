@@ -21,6 +21,7 @@
 
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <wmmintrin.h>
 
 static constexpr char DATA[] = "measurements.txt";
 static constexpr char DELIM = ';';
@@ -87,13 +88,13 @@ struct DoubleQWordStr {
   static constexpr uint64_t BIG_SIZE_MASK = 0x00FFFFFFFFFFFFFF;
 
   union {
-      std::array<uint64_t, 2> small{};
-      uint8_t raw[16];
-      struct {
-        const char* str;
-        std::size_t size;
-      } big;
-    } data;
+    std::array<uint64_t, 2> small{};
+    uint8_t raw[16];
+    struct {
+      const char *str;
+      std::size_t size;
+    } big;
+  } data;
 
   DoubleQWordStr() { std::memset(&data, 0, sizeof(data)); }
 
@@ -108,7 +109,7 @@ struct DoubleQWordStr {
   }
 
   DoubleQWordStr(const DoubleQWordStr &other) {
-    char* ptr = nullptr;
+    char *ptr = nullptr;
     if (!other.is_small()) {
       const std::size_t size = other.big_size();
       ptr = new char[size];
@@ -139,9 +140,12 @@ struct DoubleQWordStr {
 
   constexpr bool empty() const noexcept { return data.small[0] == 0; }
 
-  constexpr std::size_t big_size() const noexcept { return data.big.size & BIG_SIZE_MASK; }
+  constexpr std::size_t big_size() const noexcept {
+    return data.big.size & BIG_SIZE_MASK;
+  }
 
-  constexpr DBG_NOINLINE bool operator==(const DoubleQWordStr &other) const noexcept {
+  constexpr DBG_NOINLINE bool
+  operator==(const DoubleQWordStr &other) const noexcept {
     const uint8_t m = (static_cast<uint8_t>(is_small()) << 0) |
                       (static_cast<uint8_t>(other.is_small()) << 1);
     switch (m) {
@@ -166,7 +170,7 @@ struct DoubleQWordStr {
         std::size_t len = 0;
         while (len < sizeof(data.raw) && data.raw[len] != '\0')
           ++len;
-        return {reinterpret_cast<const char*>(data.raw), len};
+        return {reinterpret_cast<const char *>(data.raw), len};
       } else {
         return {data.big.str, big_size()};
       }
@@ -198,38 +202,32 @@ template <typename H> struct HashWrapper {
 };
 
 struct MyHash {
-
-  static constexpr std::size_t murmur64(std::size_t h) noexcept {
-    h ^= h >> 33;
-    h *= 0xff51afd7ed558ccdull;
-    h ^= h >> 33;
-    h *= 0xc4ceb9fe1a85ec53ull;
-    h ^= h >> 33;
-    return h;
-  }
-
-  static constexpr std::size_t hash(const char *s, std::size_t n) noexcept {
-    uint64_t h = 0xcbf29ce484222325ull;
-    for (std::size_t i = n; i >= 8; i -= 8) {
-      uint64_t w = 0;
-      std::memcpy(&w, s, sizeof(w));
-      h ^= w;
-      s += 8;
-      n -= 8;
+  static std::size_t hash(const char *s, std::size_t n) noexcept {
+    __m128i h = _mm_set_epi64x(0xc4ceb9fe1a85ec53ull, 0xff51afd7ed558ccdull);
+    while (n >= 16) {
+      __m128i v = _mm_load_si128(reinterpret_cast<const __m128i *>(s));
+      h = _mm_aesenc_si128(v, h);
+      s += 16;
+      n -= 16;
     }
-    uint64_t w = 0;
-    std::memcpy(&w, s, n);
-    h ^= w;
-    return murmur64(h);
+    uint64_t res = static_cast<uint64_t>(_mm_cvtsi128_si64(h));
+    for (int i = 0; i < n; i += 8) {
+      uint64_t w = 0;
+      std::memcpy(&w, s + i, std::min(n - i, 8ul));
+      res ^= w;
+    }
+    return res;
   }
 
   static constexpr std::size_t hash(const DoubleQWordStr &str) noexcept {
     if (str.is_small()) [[likely]] {
-      // Basically fnv8a
-      std::size_t h = 0xcbf29ce484222325ull;
-      h ^= str.data.small[0];
-      h ^= str.data.small[1];
-      return murmur64(h);
+      const __m128i key =
+          _mm_set_epi64x(0xc4ceb9fe1a85ec53ull, 0xff51afd7ed558ccdull);
+      __m128i v = _mm_load_si128(
+          reinterpret_cast<const __m128i *>(str.data.small.data()));
+      v = _mm_aesenc_si128(v, key);
+      v = _mm_aesenc_si128(v, key);
+      return static_cast<uint64_t>(_mm_cvtsi128_si64(v));
     } else {
       return hash(str.data.big.str, str.big_size());
     }
@@ -245,8 +243,9 @@ public:
   static constexpr auto idx = [](std::size_t h) { return h & (BUCKETS - 1); };
 
   MyFlatHashMap() : map_(nullptr) {
-    auto *ptr = do_mmap(-1, BUCKETS * sizeof(KV), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE);
-    map_ = static_cast<KV*>(ptr);
+    auto *ptr = do_mmap(-1, BUCKETS * sizeof(KV), PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE);
+    map_ = static_cast<KV *>(ptr);
   }
 
   ~MyFlatHashMap() {
@@ -265,7 +264,7 @@ public:
     for (std::size_t i = 0; i < BUCKETS; ++i) {
       auto &e = map_[s];
       if (e.key == key) [[likely]] {
-        return map_[s].value;
+        return e.value;
       }
 
       if (e.key.empty()) {
@@ -286,7 +285,7 @@ public:
   }
 
 private:
-  KV* map_;
+  KV *map_;
 };
 
 using Hash = HashWrapper<MyHash>;
@@ -350,8 +349,6 @@ void update_result(Result &r, DoubleQWordStr &&name, int16_t t) {
   s.count++;
   s.sum += t;
 }
-
-
 
 class MMappedFile {
 public:
@@ -497,14 +494,13 @@ constexpr Flavour current_flavour() {
 }
 
 struct alignas(64) Chunk {
-    const char* data;
-    std::size_t size;
+  const char *data;
+  std::size_t size;
 };
 
 using FileChunks = std::vector<Chunk>;
 
-FileChunks split_into_chunks(Chunk mem,
-                             std::size_t chunk_size) {
+FileChunks split_into_chunks(Chunk mem, std::size_t chunk_size) {
   FileChunks chunks;
   chunks.reserve((mem.size + chunk_size - 1) / chunk_size);
   std::size_t next_chunk_size = chunk_size;
@@ -538,41 +534,38 @@ struct NameParseRes {
 #define KEEP_MASK_UP(len) (static_cast<uint64_t>(KEEP_MASK(len) >> 64))
 #define KEEP_MASK_LOW(len) (static_cast<uint64_t>(KEEP_MASK(len)))
 
-
-NameParseRes parse_name_simd(const char* __restrict__ ptr) {
+NameParseRes parse_name_simd(const char *__restrict__ ptr) {
   static_assert(DELIM == 0x3B);
   static constexpr uint64_t KEEP_MASK[16][2] = {
-    {0, 0},
-    {KEEP_MASK_LOW(1), KEEP_MASK_UP(1)},
-    {KEEP_MASK_LOW(2), KEEP_MASK_UP(2)},
-    {KEEP_MASK_LOW(3), KEEP_MASK_UP(3)},
-    {KEEP_MASK_LOW(4), KEEP_MASK_UP(4)},
-    {KEEP_MASK_LOW(5), KEEP_MASK_UP(5)},
-    {KEEP_MASK_LOW(6), KEEP_MASK_UP(6)},
-    {KEEP_MASK_LOW(7), KEEP_MASK_UP(7)},
-    {KEEP_MASK_LOW(8), KEEP_MASK_UP(8)},
-    {KEEP_MASK_LOW(9), KEEP_MASK_UP(9)},
-    {KEEP_MASK_LOW(10), KEEP_MASK_UP(10)},
-    {KEEP_MASK_LOW(11), KEEP_MASK_UP(11)},
-    {KEEP_MASK_LOW(12), KEEP_MASK_UP(12)},
-    {KEEP_MASK_LOW(13), KEEP_MASK_UP(13)},
-    {KEEP_MASK_LOW(14), KEEP_MASK_UP(14)},
-    {KEEP_MASK_LOW(15), KEEP_MASK_UP(15)},
+      {0, 0},
+      {KEEP_MASK_LOW(1), KEEP_MASK_UP(1)},
+      {KEEP_MASK_LOW(2), KEEP_MASK_UP(2)},
+      {KEEP_MASK_LOW(3), KEEP_MASK_UP(3)},
+      {KEEP_MASK_LOW(4), KEEP_MASK_UP(4)},
+      {KEEP_MASK_LOW(5), KEEP_MASK_UP(5)},
+      {KEEP_MASK_LOW(6), KEEP_MASK_UP(6)},
+      {KEEP_MASK_LOW(7), KEEP_MASK_UP(7)},
+      {KEEP_MASK_LOW(8), KEEP_MASK_UP(8)},
+      {KEEP_MASK_LOW(9), KEEP_MASK_UP(9)},
+      {KEEP_MASK_LOW(10), KEEP_MASK_UP(10)},
+      {KEEP_MASK_LOW(11), KEEP_MASK_UP(11)},
+      {KEEP_MASK_LOW(12), KEEP_MASK_UP(12)},
+      {KEEP_MASK_LOW(13), KEEP_MASK_UP(13)},
+      {KEEP_MASK_LOW(14), KEEP_MASK_UP(14)},
+      {KEEP_MASK_LOW(15), KEEP_MASK_UP(15)},
   };
   NameParseRes res{};
 
-  const __m128i chunk =
-      _mm_loadu_si128(reinterpret_cast<const __m128i *>(ptr));
+  const __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i *>(ptr));
   const __m128i delim_vec = _mm_set1_epi8(DELIM);
-  const uint32_t mask =
-      static_cast<uint32_t>(_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, delim_vec)));
+  const uint32_t mask = static_cast<uint32_t>(
+      _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, delim_vec)));
 
   if (mask) [[likely]] {
     const uint32_t len = std::countr_zero(mask);
     res.len = static_cast<uint8_t>(len);
 
-    std::memcpy(res.name.data.small.data(), ptr,
-                2 * sizeof(uint64_t));
+    std::memcpy(res.name.data.small.data(), ptr, 2 * sizeof(uint64_t));
 
     res.name.data.small[0] &= KEEP_MASK[len][0];
     res.name.data.small[1] &= KEEP_MASK[len][1];
@@ -592,8 +585,8 @@ NameParseRes parse_name_simd(const char* __restrict__ ptr) {
 template <std::size_t UNROLL = 8, std::size_t CHUNK = 2 * Mb>
 DBG_NOINLINE void process_batch(Result &r, Chunk batch) {
   struct {
-    const char* begin;
-    const char* end;
+    const char *begin;
+    const char *end;
   } lanes[UNROLL];
 
   const std::size_t lane_size = batch.size / UNROLL;
@@ -612,13 +605,13 @@ DBG_NOINLINE void process_batch(Result &r, Chunk batch) {
     lanes[i].end = ptr;
   }
 
-  uint64_t lanes_state = 0;
-  constexpr uint64_t ALL_DONE = (1ull << UNROLL) - 1;
-  static_assert(UNROLL < 64);
+  uint16_t lanes_state = 0;
+  constexpr uint16_t ALL_DONE = (1 << UNROLL) - 1;
+  static_assert(UNROLL < 16);
   while (lanes_state != ALL_DONE) {
 #pragma unroll
     for (std::size_t j = 0; j < UNROLL; j++) {
-      auto& lane = lanes[j];
+      auto &lane = lanes[j];
       if (lane.begin >= lane.end) [[unlikely]] {
         lanes_state |= 1ull << j;
         continue;
@@ -666,13 +659,15 @@ Result run_workers(std::span<const char> file,
   workers.reserve(WORKERS);
   results.resize(WORKERS);
 
-  auto chunks = split_into_chunks(Chunk{file.data(), file.size()}, WORKER_CHUNK);
+  auto chunks =
+      split_into_chunks(Chunk{file.data(), file.size()}, WORKER_CHUNK);
 
   alignas(64) std::atomic<std::size_t> next_chunk{WORKERS + 1};
 
   for (std::size_t i = 0; i < WORKERS; ++i) {
     workers.push_back(std::thread([&, i]() {
-      worker_routine<UNROLL, UNROLL_CHUNK>(chunks, results[i], next_chunk, i, cpus[i]);
+      worker_routine<UNROLL, UNROLL_CHUNK>(chunks, results[i], next_chunk, i,
+                                           cpus[i]);
     }));
   }
 
@@ -686,9 +681,8 @@ Result run_workers(std::span<const char> file,
   return r;
 }
 
-
 static constexpr std::array<int, 13> CPUS = {1,  3,  6,  8,  10, 12, 13,
-                                                  14, 15, 17, 19, 20, 21};
+                                             14, 15, 17, 19, 20, 21};
 static constexpr std::size_t WORKERS = 13;
 static_assert(WORKERS <= CPUS.size());
 static constexpr std::size_t PARALLEL_CHUNK = 64 * Mb;
@@ -699,7 +693,7 @@ auto run_mt(auto &&...args) {
   return run_workers<WORKERS, UNROLL, UNROLL_CHUNK, PARALLEL_CHUNK>(args...);
 }
 
-auto run_st(std::span<const char> file, Result& r) {
+auto run_st(std::span<const char> file, Result &r) {
   Chunk c{file.data(), file.size()};
   return process_batch<UNROLL, UNROLL_CHUNK>(r, c);
 };
@@ -713,7 +707,8 @@ int main() {
 
   auto stats = [&]() {
     if constexpr (MULTITHREADED) {
-      return run_mt(file_mem, std::span<const int, WORKERS>(CPUS.cbegin(), WORKERS));
+      return run_mt(file_mem,
+                    std::span<const int, WORKERS>(CPUS.cbegin(), WORKERS));
     } else {
       Result stats;
       run_st(file_mem, stats);

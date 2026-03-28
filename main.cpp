@@ -246,6 +246,7 @@ public:
     auto *ptr = do_mmap(-1, BUCKETS * sizeof(KV), PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE);
     map_ = static_cast<KV *>(ptr);
+    idxs_.reserve(10000);
   }
 
   ~MyFlatHashMap() {
@@ -269,6 +270,7 @@ public:
 
       if (e.key.empty()) {
         e.key = std::forward<Key>(key);
+        idxs_.push_back(s);
         return e.value;
       }
 
@@ -278,14 +280,20 @@ public:
   }
 
   template <typename F> void for_each(F &&f) const {
-    for (int i = 0; i < BUCKETS; ++i) {
-      if (!map_[i].key.empty())
-        f(map_[i]);
+    for (auto idx : idxs_) {
+        f(map_[idx]);
+    }
+  }
+
+  template <typename F> void for_each(F &&f) {
+    for (auto idx : idxs_) {
+        f(map_[idx]);
     }
   }
 
 private:
   KV *map_;
+  std::vector<std::size_t> idxs_;
 };
 
 using Hash = HashWrapper<MyHash>;
@@ -300,11 +308,10 @@ struct Data {
 using Result = MyFlatHashMap<65536, DoubleQWordStr, Data, Hash>;
 static_assert(sizeof(Result::KV) == 32);
 
-void merge(Result &left, const Result &right) {
-  right.for_each([&](const Result::KV &kv) {
+void merge(Result &left, Result &right) {
+  right.for_each([&](Result::KV &kv) {
     // TODO: this is very stupid, but does not matter so much
-    auto cpy = kv.key;
-    auto &d = left.try_emplace(std::move(cpy));
+    auto &d = left.try_emplace(std::move(kv.key));
     d.min = std::min(kv.value.min, d.min);
     d.max = std::max(kv.value.max, d.max);
     d.sum += kv.value.sum;

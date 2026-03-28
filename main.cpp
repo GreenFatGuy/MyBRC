@@ -718,7 +718,7 @@ auto run_st(std::span<const char> file, Result& r) {
 };
 
 int main() {
-  static constexpr bool MULTITHREADED = false;
+  static constexpr bool MULTITHREADED = true;
 
   MMappedFile file(DATA);
   auto file_mem =
